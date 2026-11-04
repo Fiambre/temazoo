@@ -239,11 +239,39 @@ struct Snap {
     page: Option<usize>,
 }
 
+#[derive(Clone)]
+struct Account {
+    name: String,
+    handle: String,
+    photo: String,
+}
+
+/// First value stored under `key` anywhere in the JSON tree.
+fn find_key<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    match v {
+        serde_json::Value::Object(m) => m.get(key).or_else(|| m.values().find_map(|x| find_key(x, key))),
+        serde_json::Value::Array(a) => a.iter().find_map(|x| find_key(x, key)),
+        _ => None,
+    }
+}
+
+fn parse_account(v: &serde_json::Value) -> Option<Account> {
+    let text = |k: &str| find_key(v, k).and_then(|x| x["runs"][0]["text"].as_str()).unwrap_or("").to_string();
+    let name = text("accountName");
+    if name.is_empty() {
+        return None;
+    }
+    let photo = find_key(v, "accountPhoto").and_then(|x| x["thumbnails"][0]["url"].as_str()).unwrap_or("").to_string();
+    Some(Account { name, handle: text("channelHandle"), photo })
+}
+
 enum Cmd {
     /// Load (or continue) a shelf page: `idx` is the feed slot, `token` the continuation.
     Feed { idx: usize, browse: String, params: Option<String>, token: Option<String> },
     /// Rebuild the YouTube Music client from the current `headers.json`.
     Reauth,
+    /// Who is logged in (name, handle, avatar); answered with `Evt::Account`.
+    Account,
     /// Fetch the ids of the user's liked songs (to draw the heart correctly).
     LoadLikes,
     Rate { vid: String, like: bool },
@@ -288,6 +316,8 @@ enum Evt {
     /// Result of an update check (`manual` = the user asked for it, so say "up to date").
     Update { found: Option<update::Release>, manual: bool },
     UpdateFailed { msg: String, manual: bool },
+    /// `None` = no active session.
+    Account(Option<Account>),
     /// The installer is downloaded and verified.
     UpdateReady(PathBuf),
     Error(String),
@@ -656,6 +686,10 @@ fn spawn_backend(ctx: egui::Context, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<E
             rt.spawn(async move {
                 let evt = match cmd {
                     Cmd::Reauth => return, // handled before spawning
+                    Cmd::Account => Evt::Account(match client.send_request("account/account_menu", serde_json::json!({})).await {
+                        Ok(v) => parse_account(&v),
+                        Err(_) => None,
+                    }),
                     Cmd::LoadLikes => match client.get_liked_songs(Some(2000)).await {
                         Ok(p) => Evt::Likes(p.tracks.into_iter().filter_map(|t| t.video_id).collect()),
                         Err(_) => Evt::Likes(vec![]),
@@ -1320,6 +1354,7 @@ struct App {
     logging_in: bool,
     /// New version found by the updater (shown as a banner until dismissed).
     update: Option<update::Release>,
+    account: Option<Account>,
     checking_update: bool,
     updating: bool,
     cmd: mpsc::Sender<Cmd>,
@@ -1389,6 +1424,7 @@ impl App {
         let auto_check = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("installed").exists())).unwrap_or(false)
             && !update::checked_recently();
         std::thread::spawn(|| update::refresh_ytdlp(&ytdlp_path()));
+        let _ = cmd.send(Cmd::Account);
         let _ = cmd.send(Cmd::Playlists);
         let _ = audio.send(Audio::Volume(0.7));
         let _ = cmd.send(Cmd::LoadLikes);
@@ -1429,6 +1465,7 @@ impl App {
             needs_login: false,
             logging_in: false,
             update: None,
+            account: None,
             checking_update: false,
             updating: false,
             cmd,
@@ -1702,6 +1739,7 @@ impl eframe::App for App {
                         login::OK => {
                             self.status = "Sesión actualizada".into();
                             let _ = self.cmd.send(Cmd::Reauth);
+                            let _ = self.cmd.send(Cmd::Account);
                             let _ = self.cmd.send(Cmd::Playlists);
                             let _ = self.cmd.send(Cmd::LoadLikes);
                             // The pages were fetched with the old session: reload the one on screen.
@@ -1850,6 +1888,7 @@ impl eframe::App for App {
                     }
                 }
                 Evt::Prefetched => {}
+                Evt::Account(a) => self.account = a,
                 Evt::Update { found, manual } => {
                     self.checking_update = false;
                     if found.is_none() && manual {
@@ -2922,7 +2961,25 @@ impl eframe::App for App {
                 }
                 ui.add_space(10.0);
                 ui.label(egui::RichText::new("SESIÓN DE YOUTUBE MUSIC").color(DIM).size(11.0));
-                let label = if self.logging_in { "Esperando inicio de sesión..." } else { "Iniciar sesión / cambiar cuenta" };
+                if let Some(acc) = &self.account {
+                    ui.horizontal(|ui| {
+                        let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+                        cover(ui, &acc.photo, rect, 20.0);
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(&acc.name).strong());
+                            if !acc.handle.is_empty() {
+                                ui.label(egui::RichText::new(&acc.handle).color(DIM).size(12.0));
+                            }
+                            ui.label(egui::RichText::new("● Sesión activa").color(Color32::from_rgb(110, 210, 140)).size(12.0));
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+                let label = match (self.logging_in, self.account.is_some()) {
+                    (true, _) => "Esperando inicio de sesión...",
+                    (false, true) => "Cambiar de cuenta",
+                    (false, false) => "Iniciar sesión",
+                };
                 if ui.button(label).clicked() {
                     start_login = true;
                 }
