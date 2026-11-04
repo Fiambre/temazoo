@@ -13,6 +13,7 @@ const REPO: &str = "Fiambre/temazoo";
 const NO_WINDOW: u32 = 0x0800_0000;
 const NEW_GROUP: u32 = 0x0000_0200;
 const STAMP: &str = "update-check";
+const YTDLP_STAMP: &str = "ytdlp-update-check";
 
 #[derive(Clone)]
 pub struct Release {
@@ -64,9 +65,25 @@ pub fn check() -> Result<Option<Release>, String> {
     }))
 }
 
-/// True when the last automatic check was less than a day ago.
+/// Updates the bundled yt-dlp in place (`yt-dlp -U`), at most once a day. YouTube changes
+/// often and an old yt-dlp stops resolving songs. Blocks: run it on a worker thread.
+pub fn refresh_ytdlp(exe: &Path) {
+    if !exe.is_file() || recent(YTDLP_STAMP) {
+        return;
+    }
+    let ok = Command::new(exe).creation_flags(NO_WINDOW).arg("-U").output().is_ok_and(|o| o.status.success());
+    if ok {
+        let _ = std::fs::write(YTDLP_STAMP, b"");
+    }
+}
+
+/// True when the last automatic app check was less than a day ago.
 pub fn checked_recently() -> bool {
-    std::fs::metadata(STAMP)
+    recent(STAMP)
+}
+
+fn recent(stamp: &str) -> bool {
+    std::fs::metadata(stamp)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| SystemTime::now().duration_since(t).ok())

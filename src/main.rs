@@ -1388,6 +1388,7 @@ impl App {
         }
         let auto_check = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("installed").exists())).unwrap_or(false)
             && !update::checked_recently();
+        std::thread::spawn(|| update::refresh_ytdlp(&ytdlp_path()));
         let _ = cmd.send(Cmd::Playlists);
         let _ = audio.send(Audio::Volume(0.7));
         let _ = cmd.send(Cmd::LoadLikes);
