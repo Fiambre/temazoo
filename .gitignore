@@ -1,0 +1,6 @@
+/target
+/dist
+/bin
+# Sesión de Google y ajustes locales: NUNCA al repositorio
+headers.json
+config.json
