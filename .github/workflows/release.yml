@@ -18,8 +18,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Fijar versión desde el tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $v = $env:GITHUB_REF_NAME.TrimStart('v')
+          $t = Get-Content Cargo.toml -Raw
+          $t = [regex]::Replace($t, '(?m)^version = ".*"', "version = `"$v`"", 1)
+          Set-Content Cargo.toml $t -NoNewline
+
       - name: Compilar
-        run: cargo build --release --locked
+        run: cargo build --release
 
       - name: Descargar yt-dlp
         shell: pwsh

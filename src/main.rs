@@ -3,6 +3,7 @@
 mod decode;
 mod login;
 mod media;
+mod update;
 
 use eframe::egui::{self, Color32};
 use rodio::{DeviceSinkBuilder, Player, Source};
@@ -284,6 +285,11 @@ enum Evt {
     Created(String),
     Done { msg: String, reload: bool },
     Removed(String),
+    /// Result of an update check (`manual` = the user asked for it, so say "up to date").
+    Update { found: Option<update::Release>, manual: bool },
+    UpdateFailed { msg: String, manual: bool },
+    /// The installer is downloaded and verified.
+    UpdateReady(PathBuf),
     Error(String),
 }
 
@@ -1312,6 +1318,10 @@ struct App {
     evt_tx: mpsc::Sender<Evt>,
     needs_login: bool,
     logging_in: bool,
+    /// New version found by the updater (shown as a banner until dismissed).
+    update: Option<update::Release>,
+    checking_update: bool,
+    updating: bool,
     cmd: mpsc::Sender<Cmd>,
     audio: mpsc::Sender<Audio>,
     evt: mpsc::Receiver<Evt>,
@@ -1376,6 +1386,8 @@ impl App {
                 ctx.request_repaint();
             });
         }
+        let auto_check = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("installed").exists())).unwrap_or(false)
+            && !update::checked_recently();
         let _ = cmd.send(Cmd::Playlists);
         let _ = audio.send(Audio::Volume(0.7));
         let _ = cmd.send(Cmd::LoadLikes);
@@ -1415,6 +1427,9 @@ impl App {
             evt_tx,
             needs_login: false,
             logging_in: false,
+            update: None,
+            checking_update: false,
+            updating: false,
             cmd,
             audio,
             evt,
@@ -1453,7 +1468,44 @@ impl App {
             status: "Cargando playlists...".into(),
         };
         app.load_feed(HOME);
+        if auto_check {
+            app.check_update(&ctx, false);
+        }
         app
+    }
+
+    /// Looks for a newer release on a worker thread; the answer arrives as `Evt::Update`.
+    fn check_update(&mut self, ctx: &egui::Context, manual: bool) {
+        if self.checking_update || self.updating {
+            return;
+        }
+        self.checking_update = true;
+        let (tx, ctx) = (self.evt_tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(match update::check() {
+                Ok(found) => Evt::Update { found, manual },
+                Err(msg) => Evt::UpdateFailed { msg, manual },
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Downloads the offered release; `Evt::UpdateReady` follows.
+    fn start_update(&mut self, ctx: &egui::Context) {
+        let Some(rel) = self.update.clone() else { return };
+        if self.updating {
+            return;
+        }
+        self.updating = true;
+        self.status = format!("Descargando Temazoo {}...", rel.version);
+        let (tx, ctx) = (self.evt_tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(match update::download(&rel) {
+                Ok(path) => Evt::UpdateReady(path),
+                Err(msg) => Evt::UpdateFailed { msg, manual: true },
+            });
+            ctx.request_repaint();
+        });
     }
 
     /// Requests the first page (or the next one, when a token is stored) of a feed.
@@ -1797,6 +1849,29 @@ impl eframe::App for App {
                     }
                 }
                 Evt::Prefetched => {}
+                Evt::Update { found, manual } => {
+                    self.checking_update = false;
+                    if found.is_none() && manual {
+                        self.status = format!("Temazoo {} está al día", update::VERSION);
+                    }
+                    if found.is_some() {
+                        self.update = found;
+                    }
+                }
+                Evt::UpdateFailed { msg, manual } => {
+                    self.checking_update = false;
+                    self.updating = false;
+                    if manual {
+                        self.status = format!("Actualización: {msg}");
+                    }
+                }
+                Evt::UpdateReady(path) => match update::apply(&path) {
+                    Ok(()) => std::process::exit(0),
+                    Err(m) => {
+                        self.updating = false;
+                        self.status = m;
+                    }
+                },
                 Evt::Error(m) => {
                     self.loading = false;
                     for f in &mut self.feeds {
@@ -2190,6 +2265,31 @@ impl eframe::App for App {
         let mut do_search: Option<String> = None;
         let mut card_click = None;
         let mut go_back = false;
+        let (mut do_update, mut dismiss_update) = (false, false);
+        if let Some(rel) = &self.update {
+            egui::Panel::top("update")
+                .frame(egui::Frame::new().fill(ACCENT.gamma_multiply(0.25)).inner_margin(egui::Margin::symmetric(16, 8)))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Temazoo {} está disponible (tenés la {}).", rel.version, update::VERSION));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add_enabled(!self.updating, egui::Button::new("Más tarde")).clicked() {
+                                dismiss_update = true;
+                            }
+                            let label = if self.updating { "Descargando..." } else { "Actualizar ahora" };
+                            if ui.add_enabled(!self.updating, egui::Button::new(label)).clicked() {
+                                do_update = true;
+                            }
+                        });
+                    });
+                });
+        }
+        if do_update {
+            self.start_update(&ctx);
+        }
+        if dismiss_update {
+            self.update = None;
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::symmetric(20, 16)))
             .show(ui, |ui| {
@@ -2794,6 +2894,7 @@ impl eframe::App for App {
         }
 
         // ---- settings ----
+        let mut check_now = false;
         let mut open = self.show_settings;
         egui::Window::new("Configuración")
             .open(&mut open)
@@ -2825,6 +2926,15 @@ impl eframe::App for App {
                     start_login = true;
                 }
                 ui.add_space(10.0);
+                ui.label(egui::RichText::new("ACTUALIZACIONES").color(DIM).size(11.0));
+                ui.horizontal(|ui| {
+                    ui.label(format!("Versión {}", update::VERSION));
+                    let label = if self.checking_update { "Buscando..." } else { "Buscar actualizaciones" };
+                    if ui.add_enabled(!self.checking_update && !self.updating, egui::Button::new(label)).clicked() {
+                        check_now = true;
+                    }
+                });
+                ui.add_space(10.0);
                 ui.label(egui::RichText::new("CACHÉ").color(DIM).size(11.0));
                 ui.label(
                     egui::RichText::new(format!("Imágenes en memoria: {}", IMGS.lock().unwrap().order.len()))
@@ -2843,6 +2953,10 @@ impl eframe::App for App {
                 }
             });
         self.show_settings = open;
+        if check_now {
+            self.status = "Buscando actualizaciones...".into();
+            self.check_update(&ctx, true);
+        }
         evict_images(&ctx);
         if hand && self.dialog.is_none() && self.drag_from.is_none() {
             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
