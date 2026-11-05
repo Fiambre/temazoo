@@ -2672,14 +2672,6 @@ impl eframe::App for App {
                 let pin = !q.is_empty();
                 let sub = if pin { format!("{} coincidencias en la lista", idx.len()) } else { self.status.clone() };
                 ui.label(egui::RichText::new(sub).color(DIM));
-                if self.more_songs.is_some() && !pin {
-                    ui.add_space(6.0);
-                    let b = ui.add(egui::Button::new(egui::RichText::new("Ver todas las canciones  →").color(ACCENT)).corner_radius(14.0));
-                    hand |= b.hovered();
-                    if b.clicked() {
-                        acts.push(Act::AllSongs);
-                    }
-                }
                 ui.add_space(10.0);
                 let mut crow: Vec<CRow> = Vec::new();
                 let mut last_section = "";
@@ -2693,7 +2685,9 @@ impl eframe::App for App {
                     last_section = &c.section;
                     crow.push(CRow::Card(ci));
                 }
-                let rows = idx.len() + crow.len() + pin as usize;
+                // Artist page: a "Mostrar todo" row sits right under the top songs.
+                let show_all = self.more_songs.is_some() && !pin;
+                let rows = idx.len() + show_all as usize + crow.len() + pin as usize;
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, 52.0, rows, |ui, range| {
                     for r in range {
                         if pin && r == 0 {
@@ -2718,6 +2712,23 @@ impl eframe::App for App {
                             continue;
                         }
                         let k = r - pin as usize;
+                        if show_all && k == idx.len() {
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), egui::Sense::hover());
+                            let btn = egui::Rect::from_min_size(rect.left_center() + egui::vec2(8.0, -17.0), egui::vec2(128.0, 34.0));
+                            let resp = ui.interact(btn, ui.scope_id().with("show_all"), egui::Sense::click());
+                            let over = resp.hovered();
+                            hand |= over;
+                            if over {
+                                ui.painter().rect_filled(btn, 17.0, Color32::from_white_alpha(14));
+                            }
+                            ui.painter().rect_stroke(btn, 17.0, egui::Stroke::new(1.0, Color32::from_gray(if over { 120 } else { 80 })), egui::StrokeKind::Inside);
+                            ui.painter().text(btn.center(), egui::Align2::CENTER_CENTER, "Mostrar todo", egui::FontId::proportional(13.5), Color32::WHITE);
+                            if resp.clicked() {
+                                acts.push(Act::AllSongs);
+                            }
+                            continue;
+                        }
+                        let k = if show_all && k > idx.len() { k - 1 } else { k };
                         if k >= idx.len() {
                             match &crow[k - idx.len()] {
                                 CRow::Label(s) => {
