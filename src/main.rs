@@ -1909,7 +1909,7 @@ fn fmt(secs: u32) -> String {
 }
 
 impl eframe::App for App {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok(e) = self.evt.try_recv() {
             match e {
                 Evt::Session(code) => {
@@ -2121,6 +2121,11 @@ impl eframe::App for App {
                 self.want_next = true;
                 self.ensure_suggestions();
             }
+        }
+        // `ui` doesn't run while the window is minimized, but `logic` does: keep it ticking so the
+        // next song starts on its own (and media keys keep working) in the background.
+        if self.playing || self.loading || self.want_next {
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
     }
 
