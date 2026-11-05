@@ -39,15 +39,29 @@ jobs:
       - name: Instalar NSIS
         shell: pwsh
         run: |
-          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) { choco install nsis -y --no-progress }
+          # The runner image doesn't always ship NSIS and the Chocolatey feed fails now and then: retry,
+          # then fall back to the portable zip.
+          $known = 'C:\Program Files (x86)\NSIS\makensis.exe'
+          $found = (Get-Command makensis -ErrorAction SilentlyContinue)?.Source
+          for ($i = 1; -not $found -and $i -le 4; $i++) {
+            choco install nsis -y --no-progress
+            if (Test-Path $known) { $found = $known } else { Start-Sleep -Seconds (10 * $i) }
+          }
+          if (-not $found) {
+            $zip = Join-Path $env:RUNNER_TEMP 'nsis.zip'
+            Invoke-WebRequest 'https://sourceforge.net/projects/nsis/files/NSIS%203/3.11/nsis-3.11.zip/download' -OutFile $zip -MaximumRetryCount 5 -RetryIntervalSec 10 -UserAgent 'Mozilla/5.0'
+            Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+            $found = Join-Path $env:RUNNER_TEMP 'nsis-3.11\makensis.exe'
+          }
+          if (-not (Test-Path $found)) { throw 'No se pudo instalar NSIS' }
+          "MAKENSIS=$found" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Crear instalador
         shell: pwsh
         run: |
           $v = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.TrimStart('v') } else { '0.0.0-dev' }
           New-Item -ItemType Directory -Force dist | Out-Null
-          $nsis = (Get-Command makensis -ErrorAction SilentlyContinue)?.Source ?? 'C:\Program Files (x86)\NSIS\makensis.exe'
-          & $nsis "/DVERSION=$v" installer/temazoo.nsi
+          & $env:MAKENSIS "/DVERSION=$v" installer/temazoo.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis falló" }
 
       - uses: actions/upload-artifact@v4
