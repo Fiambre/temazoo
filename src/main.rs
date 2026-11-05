@@ -775,8 +775,29 @@ fn build_client() -> Arc<YTMusicClient> {
 }
 
 /// Runs this executable as a login/refresh child and returns its exit code.
+/// Pids of the `--login`/`--refresh` helper processes, so they die with the app instead of lingering.
+static CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
 fn run_child(flag: &str) -> Option<i32> {
-    std::process::Command::new(std::env::current_exe().ok()?).arg(flag).status().ok()?.code()
+    let mut child = std::process::Command::new(std::env::current_exe().ok()?).arg(flag).spawn().ok()?;
+    let pid = child.id();
+    CHILDREN.lock().ok()?.push(pid);
+    let code = child.wait().ok().and_then(|s| s.code());
+    if let Ok(mut c) = CHILDREN.lock() {
+        c.retain(|p| *p != pid);
+    }
+    code
+}
+
+fn kill_children() {
+    use std::os::windows::process::CommandExt;
+    let pids: Vec<u32> = CHILDREN.lock().map(|c| c.clone()).unwrap_or_default();
+    for p in pids {
+        let _ = std::process::Command::new("taskkill")
+            .creation_flags(0x0800_0000)
+            .args(["/F", "/T", "/PID", &p.to_string()])
+            .output();
+    }
 }
 
 /// True when `headers.json` is missing or older than 6 hours (Google rotates the tokens).
@@ -2149,7 +2170,10 @@ impl eframe::App for App {
                     }
                 }
                 Evt::UpdateReady(path) => match update::apply(&path) {
-                    Ok(()) => std::process::exit(0),
+                    Ok(()) => {
+                        kill_children();
+                        std::process::exit(0)
+                    }
                     Err(m) => {
                         self.updating = false;
                         self.status = m;
@@ -3392,7 +3416,9 @@ fn main() -> eframe::Result<()> {
         viewport = viewport.with_icon(egui::IconData { rgba: img.into_raw(), width, height });
     }
     let opts = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native("Temazoo", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    let res = eframe::run_native("Temazoo", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))));
+    kill_children();
+    res
 }
 
 

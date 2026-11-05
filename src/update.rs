@@ -122,7 +122,8 @@ pub fn download(rel: &Release) -> Result<PathBuf, String> {
 pub fn apply(installer: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let script = format!(
-        "/C \"ping -n 3 127.0.0.1 >nul & start /wait \"\" \"{}\" /S & start \"\" \"{}\"\"",
+        // The `--refresh`/`--login` helpers are the same exe and keep it locked: kill them all first.
+        "/C \"ping -n 3 127.0.0.1 >nul & taskkill /F /IM temazoo.exe >nul 2>&1 & ping -n 2 127.0.0.1 >nul & start /wait \"\" \"{}\" /S & start \"\" \"{}\"\"",
         installer.display(),
         exe.display()
     );

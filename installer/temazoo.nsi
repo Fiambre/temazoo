@@ -28,6 +28,9 @@ SetCompressor /SOLID lzma
 !insertmacro MUI_LANGUAGE "Spanish"
 
 Section "Temazoo"
+  ; A running instance (or its --refresh helper) keeps the exe locked and the copy would silently fail.
+  nsExec::Exec 'taskkill /F /IM temazoo.exe'
+  Sleep 1000
   SetOutPath "$INSTDIR"
   File "..\target\release\temazoo.exe"
   FileOpen $0 "$INSTDIR\installed" w
