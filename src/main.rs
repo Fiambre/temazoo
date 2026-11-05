@@ -506,31 +506,70 @@ fn parse_artist(v: &serde_json::Value) -> (String, Vec<Track>, Vec<Card>, Option
         let car = &s["musicCarouselShelfRenderer"];
         let section = runs(&car["header"]["musicCarouselShelfBasicHeaderRenderer"]["title"]);
         for it in car["contents"].as_array().into_iter().flatten() {
-            let i = &it["musicTwoRowItemRenderer"];
-            let browse = i["navigationEndpoint"]["browseEndpoint"]["browseId"].as_str().unwrap_or("");
-            let play = i["thumbnailOverlay"]["musicItemThumbnailOverlayRenderer"]["content"]["musicPlayButtonRenderer"]["playNavigationEndpoint"]["watchPlaylistEndpoint"]["playlistId"]
-                .as_str()
-                .unwrap_or("");
-            let (kind, id) = if browse.starts_with("MPREb") {
-                (CardKind::Album, browse)
-            } else if browse.starts_with("UC") {
-                (CardKind::Artist, browse)
-            } else if browse.starts_with("VL") && !play.is_empty() {
-                (CardKind::Playlist, play)
-            } else {
-                continue;
-            };
-            cards.push(Card {
-                kind,
-                id: id.to_string(),
-                title: runs(&i["title"]),
-                subtitle: runs(&i["subtitle"]),
-                thumb: thumbs_of(&i["thumbnailRenderer"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"]).0,
-                section: section.clone(),
-            });
+            cards.extend(two_row_card(&it["musicTwoRowItemRenderer"], &section));
         }
     }
     (name, tracks, cards, more)
+}
+
+fn two_row_card(i: &serde_json::Value, section: &str) -> Option<Card> {
+    let browse = i["navigationEndpoint"]["browseEndpoint"]["browseId"].as_str().unwrap_or("");
+    let play = i["thumbnailOverlay"]["musicItemThumbnailOverlayRenderer"]["content"]["musicPlayButtonRenderer"]["playNavigationEndpoint"]["watchPlaylistEndpoint"]["playlistId"]
+        .as_str()
+        .unwrap_or("");
+    let (kind, id) = if browse.starts_with("MPREb") {
+        (CardKind::Album, browse)
+    } else if browse.starts_with("UC") {
+        (CardKind::Artist, browse)
+    } else if browse.starts_with("VL") && !play.is_empty() {
+        (CardKind::Playlist, play)
+    } else {
+        return None;
+    };
+    Some(Card {
+        kind,
+        id: id.to_string(),
+        title: runs(&i["title"]),
+        subtitle: runs(&i["subtitle"]),
+        thumb: thumbs_of(&i["thumbnailRenderer"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"]).0,
+        section: section.to_string(),
+    })
+}
+
+/// Carousels of an artist page that have a "see all" button: (section title, browse id, params).
+fn carousel_more(v: &serde_json::Value) -> Vec<(String, String, Option<String>)> {
+    let secs = &v["contents"]["singleColumnBrowseResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"]["contents"];
+    let mut out = Vec::new();
+    for s in secs.as_array().into_iter().flatten() {
+        let h = &s["musicCarouselShelfRenderer"]["header"]["musicCarouselShelfBasicHeaderRenderer"];
+        let e = &h["moreContentButton"]["buttonRenderer"]["navigationEndpoint"]["browseEndpoint"];
+        if let Some(b) = e["browseId"].as_str() {
+            out.push((runs(&h["title"]), b.to_string(), e["params"].as_str().map(String::from)));
+        }
+    }
+    out
+}
+
+/// All album-like items (grid or carousel) of a "see all" page.
+fn parse_full_cards(v: &serde_json::Value, section: &str) -> Vec<Card> {
+    fn walk(v: &serde_json::Value, section: &str, out: &mut Vec<Card>) {
+        match v {
+            serde_json::Value::Object(m) => {
+                for (k, x) in m {
+                    if k == "musicTwoRowItemRenderer" {
+                        out.extend(two_row_card(x, section));
+                    } else {
+                        walk(x, section, out);
+                    }
+                }
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, section, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(v, section, &mut out);
+    out
 }
 
 /// Artist name from a "Artist • 3.5M views" style subtitle (skipping a leading type word).
@@ -909,7 +948,22 @@ fn spawn_backend(ctx: egui::Context, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<E
                     }
                     Cmd::Artist(id) => match client.send_request("browse", serde_json::json!({ "browseId": id })).await {
                         Ok(v) => {
-                            let (name, tracks, cards, more) = parse_artist(&v);
+                            let (name, tracks, mut cards, more) = parse_artist(&v);
+                            // The page only carries a preview of each carousel: load the full list.
+                            for (section, browse, params) in carousel_more(&v) {
+                                let mut body = serde_json::json!({ "browseId": browse });
+                                if let Some(p) = params {
+                                    body["params"] = p.into();
+                                }
+                                let Ok(full) = client.send_request("browse", body).await else { continue };
+                                let full = parse_full_cards(&full, &section);
+                                if full.len() > cards.iter().filter(|c| c.section == section).count() {
+                                    let at = cards.iter().position(|c| c.section == section).unwrap_or(cards.len());
+                                    cards.retain(|c| c.section != section);
+                                    let at = at.min(cards.len());
+                                    cards.splice(at..at, full);
+                                }
+                            }
                             Evt::Artist(name, tracks, cards, more)
                         }
                         Err(e) => Evt::Error(format!("artista: {e}")),
