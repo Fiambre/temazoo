@@ -313,6 +313,8 @@ enum Cmd {
     Playlists,
     Search(String, Kind),
     Artist(String),
+    /// Autocomplete suggestions for what is being typed.
+    Suggest(String),
     /// (browse id, params) of an artist's full list of songs.
     MoreSongs(String, Option<String>),
     Album(String),
@@ -328,6 +330,8 @@ enum Evt {
     Prefetched,
     Results(String, Kind, Vec<Track>, Vec<Card>),
     Artist(String, Vec<Track>, Vec<Card>, Option<MoreSongs>),
+    /// (typed text, suggestions)
+    Suggest(String, Vec<String>),
     Radio(Vec<Track>),
     /// Exit code of a login/refresh child process (see `login`).
     Session(i32),
@@ -910,6 +914,25 @@ fn spawn_backend(ctx: egui::Context, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<E
                         }
                         Err(e) => Evt::Error(format!("artista: {e}")),
                     },
+                    Cmd::Suggest(input) => match client.send_request("music/get_search_suggestions", serde_json::json!({ "input": input })).await {
+                        Ok(v) => {
+                            let mut out = Vec::new();
+                            for sec in v["contents"].as_array().into_iter().flatten() {
+                                for it in sec["searchSuggestionsSectionRenderer"]["contents"].as_array().into_iter().flatten() {
+                                    let s = it.get("searchSuggestionRenderer").or_else(|| it.get("historySuggestionRenderer"));
+                                    if let Some(q) = s.and_then(|s| s["navigationEndpoint"]["searchEndpoint"]["query"].as_str()) {
+                                        if !out.iter().any(|o| o == q) {
+                                            out.push(q.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            out.truncate(8);
+                            Evt::Suggest(input, out)
+                        }
+                        // Autocomplete is a nicety: never show an error for it.
+                        Err(_) => return,
+                    },
                     // Full song list of an artist ("see all" of the top songs).
                     Cmd::MoreSongs(browse, params) => {
                         let mut body = serde_json::json!({ "browseId": browse });
@@ -1476,6 +1499,13 @@ struct App {
     account: Option<Account>,
     /// Link to the full song list of the artist on screen (its "see all" button).
     more_songs: Option<MoreSongs>,
+    /// Search autocomplete: suggestions, the text they were requested for, highlighted row.
+    suggest: Vec<String>,
+    suggest_req: String,
+    suggest_sel: Option<usize>,
+    suggest_hover: bool,
+    last_query: String,
+    typed_at: std::time::Instant,
     checking_update: bool,
     updating: bool,
     cmd: mpsc::Sender<Cmd>,
@@ -1588,6 +1618,12 @@ impl App {
             update: None,
             account: None,
             more_songs: None,
+            suggest: vec![],
+            suggest_req: String::new(),
+            suggest_sel: None,
+            suggest_hover: false,
+            last_query: String::new(),
+            typed_at: std::time::Instant::now(),
             checking_update: false,
             updating: false,
             cmd,
@@ -2035,6 +2071,13 @@ impl eframe::App for App {
                 }
                 Evt::Prefetched => {}
                 Evt::Account(a) => self.account = a,
+                Evt::Suggest(input, list) => {
+                    // Ignore late answers for text that is no longer in the box.
+                    if input == self.query.trim() {
+                        self.suggest = list;
+                        self.suggest_sel = None;
+                    }
+                }
                 Evt::Update { found, manual } => {
                     self.checking_update = false;
                     if found.is_none() && manual {
@@ -2479,7 +2522,8 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::symmetric(20, 16)))
             .show(ui, |ui| {
-                egui::Frame::new()
+                let mut search_focus = false;
+                let bar = egui::Frame::new()
                     .fill(Color32::from_gray(32))
                     .corner_radius(22.0)
                     .inner_margin(egui::Margin::symmetric(14, 8))
@@ -2498,10 +2542,24 @@ impl eframe::App for App {
                                 resp.request_focus();
                                 self.focus_search = false;
                             }
+                            search_focus = resp.has_focus();
                             if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 self.query.clear();
                             }
+                            // Arrow keys move through the suggestions.
+                            if resp.has_focus() && !self.suggest.is_empty() {
+                                let n = self.suggest.len();
+                                if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                                    self.suggest_sel = Some(self.suggest_sel.map_or(0, |s| (s + 1).min(n - 1)));
+                                }
+                                if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                                    self.suggest_sel = self.suggest_sel.and_then(|s| s.checked_sub(1));
+                                }
+                            }
                             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.query.trim().is_empty() {
+                                if let Some(s) = self.suggest_sel.and_then(|i| self.suggest.get(i)).cloned() {
+                                    self.query = s;
+                                }
                                 do_search = Some(self.query.trim().to_string());
                                 resp.request_focus();
                             }
@@ -2510,6 +2568,64 @@ impl eframe::App for App {
                             }
                         });
                     });
+                // ---- autocomplete ----
+                if self.query != self.last_query {
+                    self.last_query = self.query.clone();
+                    self.typed_at = std::time::Instant::now();
+                    self.suggest_sel = None;
+                }
+                let typed = self.query.trim().to_string();
+                if typed.is_empty() {
+                    self.suggest.clear();
+                    self.suggest_req.clear();
+                } else if typed != self.suggest_req {
+                    if self.typed_at.elapsed() >= Duration::from_millis(200) {
+                        self.suggest_req = typed.clone();
+                        let _ = self.cmd.send(Cmd::Suggest(typed.clone()));
+                    } else {
+                        ctx.request_repaint_after(Duration::from_millis(220));
+                    }
+                }
+                let mut picked: Option<String> = None;
+                if (search_focus || self.suggest_hover) && !self.suggest.is_empty() && !typed.is_empty() {
+                    let r = bar.response.rect;
+                    let area = egui::Area::new(ui.scope_id().with("suggest"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(r.left_bottom() + egui::vec2(0.0, 4.0))
+                        .show(&ctx, |ui| {
+                            egui::Frame::popup(ui.style()).corner_radius(14.0).show(ui, |ui| {
+                                ui.set_width(r.width() - 16.0);
+                                for (i, s) in self.suggest.iter().enumerate() {
+                                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
+                                    if resp.hovered() || self.suggest_sel == Some(i) {
+                                        ui.painter().rect_filled(rect, 8.0, Color32::from_rgba_unmultiplied(167, 139, 250, 30));
+                                    }
+                                    magnifier(ui, rect.left_center() + egui::vec2(14.0, 0.0), 7.0, DIM);
+                                    ui.painter().with_clip_rect(rect).text(
+                                        rect.left_center() + egui::vec2(32.0, 0.0),
+                                        egui::Align2::LEFT_CENTER,
+                                        s,
+                                        egui::FontId::proportional(14.5),
+                                        Color32::WHITE,
+                                    );
+                                    hand |= resp.hovered();
+                                    if resp.clicked() {
+                                        picked = Some(s.clone());
+                                    }
+                                }
+                            });
+                        });
+                    self.suggest_hover = ctx.pointer_hover_pos().is_some_and(|p| area.response.rect.contains(p));
+                } else {
+                    self.suggest_hover = false;
+                }
+                if let Some(s) = picked {
+                    self.query = s.clone();
+                    self.last_query = s.clone();
+                    self.suggest.clear();
+                    self.suggest_req = s.clone();
+                    do_search = Some(s);
+                }
                 // Search scope only applies while searching (typing, or showing results).
                 if !self.query.trim().is_empty() || self.is_search {
                     ui.add_space(8.0);
@@ -2807,6 +2923,8 @@ impl eframe::App for App {
             self.play_index(i);
         }
         if let Some(q) = do_search {
+            self.suggest.clear();
+            self.suggest_req = q.clone();
             self.status = "Buscando...".into();
             self.pending = Some((q.clone(), self.kind));
             self.history.clear();
