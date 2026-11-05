@@ -15,7 +15,7 @@ use std::{
 };
 use ytmusicapi::{BrowserAuth, Privacy, YTMusicClient};
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Track {
     id: String,
     title: String,
@@ -27,6 +27,32 @@ struct Track {
     sug: bool,
     /// Playlist item id (needed to remove it from its playlist); empty when unknown.
     svid: String,
+    /// Browse ids / name used to jump to the artist or album page; empty when unknown.
+    artist_id: String,
+    album_id: String,
+    album: String,
+}
+
+/// First artist (`UC…`) and album (`MPREb…`) browse ids found anywhere inside `v`.
+fn ids_in(v: &serde_json::Value) -> (String, String) {
+    fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(m) => {
+                for (k, x) in m {
+                    match (k.as_str(), x.as_str()) {
+                        ("browseId", Some(s)) => out.push(s.to_string()),
+                        _ => walk(x, out),
+                    }
+                }
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            _ => {}
+        }
+    }
+    let mut all = Vec::new();
+    walk(v, &mut all);
+    let pick = |p: &str| all.iter().find(|s| s.starts_with(p)).cloned().unwrap_or_default();
+    (pick("UC"), pick("MPREb"))
 }
 
 /// Audio format requested from YouTube. Persisted in `config.json`.
@@ -237,6 +263,7 @@ struct Snap {
     search_q: String,
     sel_playlist: Option<usize>,
     page: Option<usize>,
+    more_songs: Option<MoreSongs>,
 }
 
 #[derive(Clone)]
@@ -286,6 +313,8 @@ enum Cmd {
     Playlists,
     Search(String, Kind),
     Artist(String),
+    /// (browse id, params) of an artist's full list of songs.
+    MoreSongs(String, Option<String>),
     Album(String),
     Radio(String),
     Tracks(String),
@@ -298,7 +327,7 @@ enum Evt {
     Ready(String, PathBuf),
     Prefetched,
     Results(String, Kind, Vec<Track>, Vec<Card>),
-    Artist(String, Vec<Track>, Vec<Card>),
+    Artist(String, Vec<Track>, Vec<Card>, Option<MoreSongs>),
     Radio(Vec<Track>),
     /// Exit code of a login/refresh child process (see `login`).
     Session(i32),
@@ -367,6 +396,7 @@ fn parse_search(v: &serde_json::Value) -> Vec<Track> {
             // "Artist • Album • 2:20"
             let parts: Vec<&str> = meta.split(" • ").collect();
             let thumbs = i["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"].as_array().cloned().unwrap_or_default();
+            let (artist_id, album_id) = ids_in(&i["flexColumns"][1]);
             out.push(Track {
                 id: id.to_string(),
                 title: cols.first().map(text).unwrap_or_default(),
@@ -374,7 +404,10 @@ fn parse_search(v: &serde_json::Value) -> Vec<Track> {
                 secs: parts.last().and_then(|p| parse_dur(p)).unwrap_or(0),
                 thumb: resize(&url(thumbs.first()), 96),
                 cover: resize(&url(thumbs.last()), 256),
-                sug: false, svid: String::new(),
+                album: if album_id.is_empty() { String::new() } else { parts.get(1).copied().unwrap_or_default().to_string() },
+                artist_id,
+                album_id,
+                ..Default::default()
             });
         }
     }
@@ -420,17 +453,51 @@ fn parse_search_cards(v: &serde_json::Value, kind: Kind) -> Vec<Card> {
     out
 }
 
+/// Where the full list of an artist's songs lives: (browse id, params).
+type MoreSongs = (String, Option<String>);
+
+/// "Songs" of an artist/album/playlist page that opens as its own list (`musicPlaylistShelfRenderer`).
+fn parse_shelf_songs(v: &serde_json::Value) -> Vec<Track> {
+    let Some(shelf) = find_key(v, "musicPlaylistShelfRenderer") else { return vec![] };
+    let mut out = Vec::new();
+    for it in shelf["contents"].as_array().into_iter().flatten() {
+        let i = &it["musicResponsiveListItemRenderer"];
+        let Some(id) = i["playlistItemData"]["videoId"].as_str() else { continue };
+        let (thumb, cover) = thumbs_of(&i["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"]);
+        let (artist_id, _) = ids_in(&i["flexColumns"][1]);
+        let (_, album_id) = ids_in(&i["flexColumns"][2]);
+        out.push(Track {
+            id: id.to_string(),
+            title: list_col(i, 0),
+            artist: list_col(i, 1),
+            album: if album_id.is_empty() { String::new() } else { list_col(i, 2) },
+            secs: parse_dur(&runs(&i["fixedColumns"][0]["musicResponsiveListItemFixedColumnRenderer"]["text"])).unwrap_or(0),
+            thumb,
+            cover,
+            artist_id,
+            album_id,
+            ..Default::default()
+        });
+    }
+    out
+}
+
 /// Artist page: top songs plus carousels of albums, singles, playlists and related artists.
-fn parse_artist(v: &serde_json::Value) -> (String, Vec<Track>, Vec<Card>) {
+fn parse_artist(v: &serde_json::Value) -> (String, Vec<Track>, Vec<Card>, Option<MoreSongs>) {
     let name = runs(&v["header"]["musicImmersiveHeaderRenderer"]["title"]);
     let secs = &v["contents"]["singleColumnBrowseResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"]["contents"];
-    let (mut tracks, mut cards) = (Vec::new(), Vec::new());
+    let (mut tracks, mut cards, mut more) = (Vec::new(), Vec::new(), None);
     for s in secs.as_array().into_iter().flatten() {
-        for it in s["musicShelfRenderer"]["contents"].as_array().into_iter().flatten() {
+        let shelf = &s["musicShelfRenderer"];
+        if let Some(e) = shelf["bottomEndpoint"]["browseEndpoint"].as_object().filter(|_| shelf["contents"].is_array()) {
+            more = e.get("browseId").and_then(|b| b.as_str()).map(|b| (b.to_string(), e.get("params").and_then(|p| p.as_str()).map(String::from)));
+        }
+        for it in shelf["contents"].as_array().into_iter().flatten() {
             let i = &it["musicResponsiveListItemRenderer"];
             let Some(id) = i["playlistItemData"]["videoId"].as_str() else { continue };
             let (thumb, cover) = thumbs_of(&i["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"]);
-            tracks.push(Track { id: id.to_string(), title: list_col(i, 0), artist: list_col(i, 1), secs: 0, thumb, cover, sug: false, svid: String::new() });
+            let (artist_id, _) = ids_in(&i["flexColumns"][1]);
+            tracks.push(Track { id: id.to_string(), title: list_col(i, 0), artist: list_col(i, 1), thumb, cover, artist_id, ..Default::default() });
         }
         let car = &s["musicCarouselShelfRenderer"];
         let section = runs(&car["header"]["musicCarouselShelfBasicHeaderRenderer"]["title"]);
@@ -459,7 +526,7 @@ fn parse_artist(v: &serde_json::Value) -> (String, Vec<Track>, Vec<Card>) {
             });
         }
     }
-    (name, tracks, cards)
+    (name, tracks, cards, more)
 }
 
 /// Artist name from a "Artist • 3.5M views" style subtitle (skipping a leading type word).
@@ -478,15 +545,16 @@ fn feed_item(it: &serde_json::Value) -> Option<FeedItem> {
         let (_, cover) = thumbs_of(&x["thumbnailRenderer"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"]);
         let (title, subtitle) = (runs(&x["title"]), runs(&x["subtitle"]));
         if let Some(v) = x["navigationEndpoint"]["watchEndpoint"]["videoId"].as_str() {
+            let (artist_id, album_id) = ids_in(&x["subtitle"]);
             return Some(FeedItem::Song(Track {
                 id: v.to_string(),
                 title,
                 artist: first_artist(&subtitle),
-                secs: 0,
                 thumb: cover.clone(),
                 cover,
-                sug: false,
-                svid: String::new(),
+                artist_id,
+                album_id,
+                ..Default::default()
             }));
         }
         let browse = x["navigationEndpoint"]["browseEndpoint"]["browseId"].as_str()?;
@@ -504,15 +572,16 @@ fn feed_item(it: &serde_json::Value) -> Option<FeedItem> {
     if let Some(x) = it.get("musicResponsiveListItemRenderer") {
         let id = x["playlistItemData"]["videoId"].as_str()?;
         let (thumb, cover) = thumbs_of(&x["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"]);
+        let (artist_id, album_id) = ids_in(&x["flexColumns"][1]);
         return Some(FeedItem::Song(Track {
             id: id.to_string(),
             title: list_col(x, 0),
             artist: first_artist(&list_col(x, 1)),
-            secs: 0,
             thumb,
             cover,
-            sug: false,
-            svid: String::new(),
+            artist_id,
+            album_id,
+            ..Default::default()
         }));
     }
     if let Some(x) = it.get("musicNavigationButtonRenderer") {
@@ -570,14 +639,19 @@ fn parse_radio(v: &serde_json::Value) -> Vec<Track> {
         let (thumb, cover) = thumbs_of(&v["thumbnail"]["thumbnails"]);
         // "Artist • Album • 2026"
         let byline = runs(&v["longBylineText"]);
+        let (artist_id, album_id) = ids_in(&v["longBylineText"]);
         out.push(Track {
             id: id.to_string(),
             title: runs(&v["title"]),
             artist: byline.split(" • ").next().unwrap_or_default().to_string(),
+            album: if album_id.is_empty() { String::new() } else { byline.split(" • ").nth(1).unwrap_or_default().to_string() },
             secs: parse_dur(&runs(&v["lengthText"])).unwrap_or(0),
             thumb,
             cover,
-            sug: true, svid: String::new(),
+            sug: true,
+            artist_id,
+            album_id,
+            ..Default::default()
         });
     }
     out
@@ -589,6 +663,8 @@ fn parse_album(v: &serde_json::Value) -> Vec<Track> {
     let hdr = &main["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"]["contents"][0]["musicResponsiveHeaderRenderer"];
     let (thumb, cover) = thumbs_of(&hdr["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"]);
     let artist = runs(&hdr["straplineTextOne"]);
+    let (artist_id, _) = ids_in(&hdr["straplineTextOne"]);
+    let album = runs(&hdr["title"]);
     let mut out = Vec::new();
     for s in main["secondaryContents"]["sectionListRenderer"]["contents"].as_array().into_iter().flatten() {
         for it in s["musicShelfRenderer"]["contents"].as_array().into_iter().flatten() {
@@ -601,7 +677,9 @@ fn parse_album(v: &serde_json::Value) -> Vec<Track> {
                 secs: parse_dur(&runs(&i["fixedColumns"][0]["musicResponsiveListItemFixedColumnRenderer"]["text"])).unwrap_or(0),
                 thumb: thumb.clone(),
                 cover: cover.clone(),
-                sug: false, svid: String::new(),
+                artist_id: artist_id.clone(),
+                album: album.clone(),
+                ..Default::default()
             });
         }
     }
@@ -827,11 +905,22 @@ fn spawn_backend(ctx: egui::Context, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<E
                     }
                     Cmd::Artist(id) => match client.send_request("browse", serde_json::json!({ "browseId": id })).await {
                         Ok(v) => {
-                            let (name, tracks, cards) = parse_artist(&v);
-                            Evt::Artist(name, tracks, cards)
+                            let (name, tracks, cards, more) = parse_artist(&v);
+                            Evt::Artist(name, tracks, cards, more)
                         }
                         Err(e) => Evt::Error(format!("artista: {e}")),
                     },
+                    // Full song list of an artist ("see all" of the top songs).
+                    Cmd::MoreSongs(browse, params) => {
+                        let mut body = serde_json::json!({ "browseId": browse });
+                        if let Some(p) = params {
+                            body["params"] = p.into();
+                        }
+                        match client.send_request("browse", body).await {
+                            Ok(v) => Evt::Tracks(parse_shelf_songs(&v)),
+                            Err(e) => Evt::Error(format!("canciones del artista: {e}")),
+                        }
+                    }
                     Cmd::Radio(id) => {
                         let body = serde_json::json!({ "videoId": id, "playlistId": format!("RDAMVM{id}"), "isAudioOnly": true });
                         match client.send_request("next", body).await {
@@ -840,7 +929,7 @@ fn spawn_backend(ctx: egui::Context, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<E
                         }
                     }
                     Cmd::Album(id) => match client.send_request("browse", serde_json::json!({ "browseId": id })).await {
-                        Ok(v) => Evt::Tracks(parse_album(&v)),
+                        Ok(v) => Evt::Tracks(parse_album(&v).into_iter().map(|t| Track { album_id: id.clone(), ..t }).collect()),
                         Err(e) => Evt::Error(format!("álbum: {e}")),
                     },
                     Cmd::Tracks(id) => {
@@ -862,8 +951,11 @@ fn spawn_backend(ctx: egui::Context, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<E
                                             secs: t.duration_seconds.or_else(|| t.duration.as_deref().and_then(parse_dur)).unwrap_or(0),
                                             thumb: t.thumbnails.first().map(|x| resize(&x.url, 96)).unwrap_or_default(),
                                             cover: t.thumbnails.last().map(|x| resize(&x.url, 256)).unwrap_or_default(),
-                                            sug: false,
                                             svid: t.set_video_id.clone().unwrap_or_default(),
+                                            artist_id: t.artists.iter().find_map(|a| a.id.clone()).unwrap_or_default(),
+                                            album_id: t.album.as_ref().and_then(|a| a.id.clone()).unwrap_or_default(),
+                                            album: t.album.as_ref().map(|a| a.name.clone()).unwrap_or_default(),
+                                            ..Default::default()
                                         })
                                     })
                                     .collect(),
@@ -1281,7 +1373,7 @@ fn cover(ui: &mut egui::Ui, url: &str, rect: egui::Rect, radius: f32) {
 }
 
 /// A song row used in "Quick picks"-style shelves.
-fn song_row(ui: &mut egui::Ui, t: &Track, w: f32, is_cur: bool, hand: &mut bool) -> egui::Response {
+fn song_row(ui: &mut egui::Ui, t: &Track, w: f32, is_cur: bool, hand: &mut bool, go_artist: &mut bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 52.0), egui::Sense::click());
     let hovered = ui.rect_contains_pointer(rect);
     *hand |= hovered;
@@ -1292,8 +1384,29 @@ fn song_row(ui: &mut egui::Ui, t: &Track, w: f32, is_cur: bool, hand: &mut bool)
     let clip = egui::Rect::from_min_size(rect.min + egui::vec2(58.0, 0.0), egui::vec2(w - 66.0, 52.0));
     let p = ui.painter().with_clip_rect(clip);
     p.text(egui::pos2(clip.left(), rect.center().y - 9.0), egui::Align2::LEFT_CENTER, &t.title, egui::FontId::proportional(14.5), if is_cur { ACCENT } else { Color32::WHITE });
-    p.text(egui::pos2(clip.left(), rect.center().y + 10.0), egui::Align2::LEFT_CENTER, &t.artist, egui::FontId::proportional(12.5), DIM);
+    *go_artist = artist_line(ui, &resp, clip, rect.center().y + 10.0, t, 12.5);
     resp
+}
+
+/// Draws the artist line of a song row. When the artist is known it turns into a link on hover;
+/// returns true when it was clicked (the row must not start playing then).
+fn artist_line(ui: &mut egui::Ui, row: &egui::Response, clip: egui::Rect, y: f32, t: &Track, size: f32) -> bool {
+    let font = egui::FontId::proportional(size);
+    let linked = !t.artist_id.is_empty() && !t.artist.is_empty();
+    let g = ui.painter().layout_no_wrap(t.artist.clone(), font, DIM);
+    let pos = egui::pos2(clip.left(), y - g.size().y / 2.0);
+    let area = egui::Rect::from_min_size(pos, g.size()).intersect(clip);
+    let over = linked && row.hovered() && ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| area.contains(p));
+    let color = if over { Color32::WHITE } else { DIM };
+    let p = ui.painter().with_clip_rect(clip);
+    let g = p.layout_no_wrap(t.artist.clone(), egui::FontId::proportional(size), color);
+    let bottom = pos.y + g.size().y;
+    let width = g.size().x.min(clip.width());
+    p.galley(pos, g, color);
+    if over {
+        p.line_segment([egui::pos2(pos.x, bottom), egui::pos2(pos.x + width, bottom)], egui::Stroke::new(1.0, color));
+    }
+    over && row.clicked()
 }
 
 /// Chevron button to scroll a shelf (`right = true` points right).
@@ -1329,6 +1442,12 @@ enum Act {
     AddTo(String, String, String),
     NewWith(Track),
     RemoveFrom(String, String, String),
+    /// Open an artist page: (browse id, name).
+    GoArtist(String, String),
+    /// Open an album page: (browse id, name).
+    GoAlbum(String, String),
+    /// Open the full list of songs of the artist on screen.
+    AllSongs,
 }
 
 struct App {
@@ -1355,6 +1474,8 @@ struct App {
     /// New version found by the updater (shown as a banner until dismissed).
     update: Option<update::Release>,
     account: Option<Account>,
+    /// Link to the full song list of the artist on screen (its "see all" button).
+    more_songs: Option<MoreSongs>,
     checking_update: bool,
     updating: bool,
     cmd: mpsc::Sender<Cmd>,
@@ -1466,6 +1587,7 @@ impl App {
             logging_in: false,
             update: None,
             account: None,
+            more_songs: None,
             checking_update: false,
             updating: false,
             cmd,
@@ -1566,6 +1688,7 @@ impl App {
             search_q: self.search_q.clone(),
             sel_playlist: self.sel_playlist,
             page: self.page,
+            more_songs: self.more_songs.take(),
         });
     }
 
@@ -1714,6 +1837,26 @@ impl App {
             Act::NewWith(t) => {
                 self.dialog = Some(Dialog { kind: DlgKind::New { with: Some(t) }, name: String::new(), desc: String::new(), privacy: Priv::Private });
             }
+            Act::GoArtist(id, name) => {
+                self.open_card(Card { kind: CardKind::Artist, id, title: name, subtitle: String::new(), thumb: String::new(), section: String::new() });
+            }
+            Act::GoAlbum(id, name) => {
+                let title = if name.is_empty() { "Álbum".to_string() } else { name };
+                self.open_card(Card { kind: CardKind::Album, id, title, subtitle: String::new(), thumb: String::new(), section: String::new() });
+            }
+            Act::AllSongs => {
+                if let Some((browse, params)) = self.more_songs.clone() {
+                    let title = format!("{} · Canciones", self.view_title.clone().unwrap_or_default());
+                    self.push_snap();
+                    self.view_title = Some(title);
+                    self.is_search = false;
+                    self.sel_playlist = None;
+                    self.sel_id = None;
+                    self.query.clear();
+                    self.status = "Cargando...".into();
+                    let _ = self.cmd.send(Cmd::MoreSongs(browse, params));
+                }
+            }
             _ => {}
         }
         // Edits may have left the playing song as the last one.
@@ -1845,6 +1988,7 @@ impl eframe::App for App {
                         self.tracks = t;
                         self.cards = c;
                         self.is_search = true;
+                        self.more_songs = None;
                         self.page = None;
                         self.sel_playlist = None;
                         self.sel_id = None;
@@ -1853,15 +1997,17 @@ impl eframe::App for App {
                         self.query.clear();
                     }
                 }
-                Evt::Artist(name, t, c) => {
+                Evt::Artist(name, t, c, more) => {
                     self.status = format!("{} canciones, {} más", t.len(), c.len());
                     self.tracks = t;
                     self.cards = c;
                     self.is_search = false;
                     self.view_title = Some(name);
+                    self.more_songs = more;
                 }
                 Evt::Tracks(t) => {
                     self.cards.clear();
+                    self.more_songs = None;
                     self.status = format!("{} canciones", t.len());
                     self.tracks = t;
                 }
@@ -2439,7 +2585,11 @@ impl eframe::App for App {
                                                     for &ii in col {
                                                         if let FeedItem::Song(t) = &shelf.items[ii] {
                                                             let is_cur = self.now.as_ref().is_some_and(|n| n.id == t.id);
-                                                            if song_row(ui, t, 360.0, is_cur, &mut hand).clicked() {
+                                                            let mut go_artist = false;
+                                                            let resp = song_row(ui, t, 360.0, is_cur, &mut hand, &mut go_artist);
+                                                            if go_artist {
+                                                                acts.push(Act::GoArtist(t.artist_id.clone(), t.artist.clone()));
+                                                            } else if resp.clicked() {
                                                                 feed_click = Some((fi, si, ii));
                                                             }
                                                         }
@@ -2522,6 +2672,14 @@ impl eframe::App for App {
                 let pin = !q.is_empty();
                 let sub = if pin { format!("{} coincidencias en la lista", idx.len()) } else { self.status.clone() };
                 ui.label(egui::RichText::new(sub).color(DIM));
+                if self.more_songs.is_some() && !pin {
+                    ui.add_space(6.0);
+                    let b = ui.add(egui::Button::new(egui::RichText::new("Ver todas las canciones  →").color(ACCENT)).corner_radius(14.0));
+                    hand |= b.hovered();
+                    if b.clicked() {
+                        acts.push(Act::AllSongs);
+                    }
+                }
                 ui.add_space(10.0);
                 let mut crow: Vec<CRow> = Vec::new();
                 let mut last_section = "";
@@ -2614,13 +2772,7 @@ impl eframe::App for App {
                             egui::FontId::proportional(15.0),
                             if is_cur { ACCENT } else { Color32::WHITE },
                         );
-                        p.text(
-                            egui::pos2(clip.left(), rect.center().y + 10.0),
-                            egui::Align2::LEFT_CENTER,
-                            &t.artist,
-                            egui::FontId::proportional(12.5),
-                            DIM,
-                        );
+                        let go_artist = artist_line(ui, &resp, clip, rect.center().y + 10.0, t, 12.5);
                         if t.secs > 0 {
                             ui.painter().text(
                                 egui::pos2(rect.right() - 40.0, rect.center().y),
@@ -2632,6 +2784,8 @@ impl eframe::App for App {
                         }
                         if let Some(pos) = row_menu_trigger(ui, rect, &resp) {
                             open_menu = Some(Menu { pos, track: t.clone(), qidx: None, frame: frame_nr });
+                        } else if go_artist {
+                            acts.push(Act::GoArtist(t.artist_id.clone(), t.artist.clone()));
                         } else if resp.clicked() {
                             clicked = Some(i);
                         }
@@ -2692,6 +2846,7 @@ impl eframe::App for App {
                 self.tracks = s.tracks;
                 self.cards = s.cards;
                 self.view_title = s.view_title;
+                self.more_songs = s.more_songs;
                 self.is_search = s.is_search;
                 self.search_q = s.search_q;
                 self.sel_playlist = s.sel_playlist;
@@ -2753,6 +2908,14 @@ impl eframe::App for App {
                         let liked = self.liked.contains(&m.track.id);
                         if menu_item(ui, if liked { "Quitar de Me gusta" } else { "Me gusta" }) {
                             acts.push(Act::Like(m.track.id.clone(), !liked));
+                            close_menu = true;
+                        }
+                        if !m.track.artist_id.is_empty() && menu_item(ui, "Ir al artista") {
+                            acts.push(Act::GoArtist(m.track.artist_id.clone(), m.track.artist.clone()));
+                            close_menu = true;
+                        }
+                        if !m.track.album_id.is_empty() && menu_item(ui, "Ir al álbum") {
+                            acts.push(Act::GoAlbum(m.track.album_id.clone(), m.track.album.clone()));
                             close_menu = true;
                         }
                         ui.separator();
