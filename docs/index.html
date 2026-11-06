@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Temazoo · YouTube Music liviano para Windows</title>
+<meta name="description" content="Reproductor de escritorio de YouTube Music para Windows, hecho en Rust. Arranca en ~200 MB de RAM, sin Electron ni navegador.">
+<link rel="icon" href="favicon.png">
+<style>
+:root{--bg:#0f0f12;--card:#1a1a20;--line:#2a2a33;--text:#ececf1;--mute:#9a9aa8;--accent:#ff4d5e}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 system-ui,Segoe UI,Roboto,sans-serif}
+a{color:var(--accent)}
+.wrap{max-width:1000px;margin:0 auto;padding:0 24px}
+header{padding:72px 0 40px;text-align:center}
+header img.logo{width:96px;height:96px;border-radius:22px}
+h1{font-size:clamp(2.2rem,6vw,3.4rem);margin:16px 0 8px;letter-spacing:-.02em}
+.lead{color:var(--mute);font-size:1.15rem;max-width:620px;margin:0 auto 28px}
+.btn{display:inline-block;background:var(--accent);color:#fff;text-decoration:none;font-weight:600;padding:14px 28px;border-radius:12px}
+.btn:hover{filter:brightness(1.1)}
+.btn.ghost{background:transparent;border:1px solid var(--line);color:var(--text);margin-left:8px}
+.small{color:var(--mute);font-size:.85rem;margin-top:12px}
+.shot{margin:24px auto 0;display:block;width:100%;max-width:960px;border-radius:14px;border:1px solid var(--line);box-shadow:0 24px 70px rgba(0,0,0,.55)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin:56px 0}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;text-align:center}
+.stat b{display:block;font-size:2rem;color:var(--accent)}
+.stat span{color:var(--mute);font-size:.9rem}
+h2{font-size:1.6rem;margin:56px 0 16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px}
+.card h3{margin:0 0 6px;font-size:1.05rem}
+.card p{margin:0;color:var(--mute);font-size:.95rem}
+footer{border-top:1px solid var(--line);margin-top:72px;padding:28px 0 48px;color:var(--mute);font-size:.88rem;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <img class="logo" src="logo.png" alt="Temazoo">
+  <h1>Temazoo</h1>
+  <p class="lead">YouTube Music en tu escritorio, sin gastar 1&nbsp;GB de RAM. Hecho en Rust para Windows.</p>
+  <a class="btn" id="dl" href="https://github.com/Fiambre/temazoo/releases/latest">Descargar para Windows</a>
+  <a class="btn ghost" href="https://github.com/Fiambre/temazoo">Código en GitHub</a>
+  <p class="small" id="ver">Windows 10/11 · se instala sin permisos de administrador</p>
+  <img class="shot" src="screenshot.png" alt="Captura de Temazoo">
+</header>
+
+<div class="stats">
+  <div class="stat"><b>~200 MB</b><span>de RAM al arrancar</span></div>
+  <div class="stat"><b>350–450 MB</b><span>navegando con carátulas</span></div>
+  <div class="stat"><b>1 clic</b><span>para actualizar</span></div>
+</div>
+
+<h2>Qué hace</h2>
+<div class="grid">
+  <div class="card"><h3>Inicio y Explorar</h3><p>Estantes, categorías y scroll infinito como en YouTube Music.</p></div>
+  <div class="card"><h3>Búsqueda con autocompletado</h3><p>Canciones, artistas y álbumes, con páginas de artista y discografía completa.</p></div>
+  <div class="card"><h3>Tus playlists</h3><p>Crear, editar, agregar y quitar canciones. Me gusta con un clic.</p></div>
+  <div class="card"><h3>Cola inteligente</h3><p>Arrastrá para reordenar, precarga la siguiente y sugiere más cuando se acaba.</p></div>
+  <div class="card"><h3>Audio en Opus o AAC</h3><p>Elegí la calidad en Configuración. Sigue sonando con la ventana minimizada.</p></div>
+  <div class="card"><h3>Teclas multimedia</h3><p><code>Espacio</code> pausa, <code>Ctrl+←/→</code> anterior y siguiente, y las teclas de Windows.</p></div>
+  <div class="card"><h3>Tu cuenta</h3><p>Iniciás sesión con una ventana de Google. La sesión se renueva sola.</p></div>
+  <div class="card"><h3>Se actualiza solo</h3><p>Avisa cuando hay versión nueva y yt-dlp se mantiene al día.</p></div>
+</div>
+
+<h2>Instalación</h2>
+<p>Descargá <code>Temazoo-Setup-x.y.z.exe</code>, ejecutalo y listo. Crea accesos directos en el escritorio y el menú inicio. En el primer arranque, entrá a Configuración → <em>Iniciar sesión</em>. Tus datos quedan en <code>%LOCALAPPDATA%\Temazoo</code> y no se borran al desinstalar.</p>
+<p class="small">El instalador no está firmado, así que SmartScreen puede avisar: "Más información" → "Ejecutar de todas formas".</p>
+
+<footer>
+  Proyecto personal, no afiliado a Google ni a YouTube. Hecho con Rust, egui, rodio y yt-dlp.<br>
+  <a href="https://github.com/Fiambre/temazoo">GitHub</a> · <a href="https://github.com/Fiambre/temazoo/releases">Versiones</a>
+</footer>
+</div>
+<script>
+fetch('https://api.github.com/repos/Fiambre/temazoo/releases/latest').then(r=>r.json()).then(r=>{
+  const a=(r.assets||[]).find(x=>/^Temazoo-Setup.*\.exe$/.test(x.name));
+  if(a){document.getElementById('dl').href=a.browser_download_url;
+    document.getElementById('ver').textContent='Versión '+r.tag_name.replace(/^v/,'')+' · Windows 10/11 · se instala sin permisos de administrador';}
+}).catch(()=>{});
+</script>
+</body>
+</html>
