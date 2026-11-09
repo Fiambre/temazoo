@@ -3,6 +3,8 @@
 Reproductor de escritorio de **YouTube Music** para Windows, hecho en Rust para gastar poca memoria.
 Una app de navegador o Electron ronda 1 GB de RAM; Temazoo arranca en ~200 MB y, navegando con carátulas, se mantiene entre 350 y 450 MB.
 
+**Sitio:** https://fiambre.github.io/temazoo/
+
 ![Temazoo](docs/screenshot.png)
 
 ## Qué hace
