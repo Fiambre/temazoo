@@ -10,10 +10,13 @@ Una app de navegador o Electron ronda 1 GB de RAM; Temazoo arranca en ~200 MB y,
 ## Qué hace
 
 - **Inicio y Explorar** como en YouTube Music (estantes, categorías, continuación al hacer scroll).
-- **Búsqueda** de canciones, artistas y álbumes, con páginas de artista y de álbum.
+- **Búsqueda** con autocompletado de canciones, videos, artistas, álbumes y listas, con páginas de artista (discografía completa) y de álbum.
+- **Radio** desde cualquier canción, **aleatorio** y **repetir** (toda la cola o una canción).
 - **Tus playlists**: crear, editar, borrar, agregar y quitar canciones. Me gusta con un clic.
 - **Cola** con arrastrar para reordenar, reproducir al pinchar la carátula y sugerencias automáticas cuando se acaba.
-- **Audio** en Opus (mejor calidad) o AAC, a elegir en Configuración. Precarga la siguiente canción.
+- **Audio** en Opus (mejor calidad) o AAC, a elegir en Configuración, que está ordenada por secciones. Precarga la siguiente canción.
+- **Video** opcional para las canciones que lo tienen, en la Cola y en **pantalla completa** (F11), con la calidad máxima a elegir. El decodificador es el que trae Windows, así que no suma dependencias, y con la opción apagada no gasta nada.
+- **Letras** sincronizadas (LRCLIB) o en texto (YouTube Music): en la Cola, o en pantalla completa sobre el video con las líneas desvaneciéndose, o en un panel lateral.
 - **Teclas multimedia** de Windows, `Espacio` para pausar y `Ctrl+←/→` para anterior/siguiente.
 - **Inicio de sesión** con una ventana de Google (WebView2). La sesión se renueva sola.
 - **Actualizaciones automáticas**: avisa cuando hay una versión nueva y se instala con un clic. yt-dlp se actualiza solo.

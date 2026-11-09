@@ -4,6 +4,7 @@ mod decode;
 mod login;
 mod media;
 mod update;
+mod video;
 
 use eframe::egui::{self, Color32};
 use rodio::{DeviceSinkBuilder, Player, Source};
@@ -105,11 +106,58 @@ fn load_autoplay() -> bool {
         .is_some_and(|v| v["autoplay"] == true)
 }
 
-fn save_config(q: Quality, prefetch: bool, autoplay: bool) {
+/// Show the video of songs that have one. Off by default: nothing video-related is loaded then.
+fn load_video() -> bool {
+    std::fs::read_to_string("config.json")
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .is_some_and(|v| v["video"] == true)
+}
+
+/// How the lyrics look over the fullscreen video.
+#[derive(Clone, Copy, PartialEq)]
+enum LyricsStyle {
+    /// A few lines at the bottom of the picture, fading in and out as the song moves.
+    Overlay,
+    /// A side panel with the whole lyrics, picture on the left.
+    Panel,
+}
+
+/// Lyrics settings: (style, lines visible in the overlay, show them when entering fullscreen).
+fn load_lyrics_cfg() -> (LyricsStyle, u8, bool) {
+    let v = std::fs::read_to_string("config.json").ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).unwrap_or_default();
+    let style = if v["lyrics_style"] == "panel" { LyricsStyle::Panel } else { LyricsStyle::Overlay };
+    let lines = match v["lyrics_lines"].as_u64() {
+        Some(1) => 1,
+        Some(5) => 5,
+        _ => 3,
+    };
+    (style, lines, v["lyrics_fullscreen"] == true)
+}
+
+/// Maximum video height in fullscreen: 480, 720 or 1080; 0 = whatever the screen needs (up to 1080).
+fn load_fs_quality() -> u32 {
+    std::fs::read_to_string("config.json")
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v["fullscreen_quality"].as_u64())
+        .map_or(720, |n| match n {
+            0 => 0,
+            1..=480 => 480,
+            481..=720 => 720,
+            _ => 1080,
+        })
+}
+
+fn save_config(q: Quality, prefetch: bool, autoplay: bool, video: bool, lyrics: (LyricsStyle, u8, bool), fs_quality: u32) {
     let f = if q == Quality::Aac { "aac" } else { "opus" };
+    let style = if lyrics.0 == LyricsStyle::Panel { "panel" } else { "overlay" };
     let _ = std::fs::write(
         "config.json",
-        format!("{{\n  \"audio_format\": \"{f}\",\n  \"prefetch\": {prefetch},\n  \"autoplay\": {autoplay}\n}}\n"),
+        format!(
+            "{{\n  \"audio_format\": \"{f}\",\n  \"prefetch\": {prefetch},\n  \"autoplay\": {autoplay},\n  \"video\": {video},\n  \"lyrics_style\": \"{style}\",\n  \"lyrics_lines\": {},\n  \"lyrics_fullscreen\": {},\n  \"fullscreen_quality\": {}\n}}\n",
+            lyrics.1, lyrics.2, fs_quality
+        ),
     );
 }
 
@@ -145,14 +193,24 @@ fn downloaded(id: &str, q: Quality) -> Option<PathBuf> {
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Songs,
+    Videos,
     Artists,
     Albums,
+    Playlists,
 }
 
 impl Kind {
+    /// Results that are songs/videos (played directly) rather than cards to open.
+    fn is_tracks(self) -> bool {
+        matches!(self, Kind::Songs | Kind::Videos)
+    }
+
     fn params(self) -> &'static str {
         match self {
             Kind::Songs => "EgWKAQIIAWoMEA4QChADEAQQCRAF",
+            Kind::Videos => "EgWKAQIQAWoMEA4QChADEAQQCRAF",
+            // Community playlists; the featured ones are requested separately (see `Cmd::Search`).
+            Kind::Playlists => "EgeKAQQoAEABagwQDhAKEAMQBBAJEAU%3D",
             Kind::Albums => "EgWKAQIYAWoMEA4QChADEAQQCRAF",
             Kind::Artists => "EgWKAQIgAWoMEA4QChADEAQQCRAF",
         }
@@ -282,6 +340,130 @@ fn find_key<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::V
     }
 }
 
+/// "[01:23.45] text" lines → (milliseconds, text), sorted. Metadata tags ("[ar:...]") are skipped; a line
+/// with several time tags (repeated chorus) becomes one entry per tag.
+fn parse_lrc(s: &str) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    for line in s.lines() {
+        let mut rest = line.trim();
+        let mut times = Vec::new();
+        while let Some(r) = rest.strip_prefix('[') {
+            let Some(end) = r.find(']') else { break };
+            let tag = &r[..end];
+            let ms = tag.split_once(':').and_then(|(m, sec)| {
+                let (m, sec) = (m.parse::<u32>().ok()?, sec.parse::<f64>().ok()?);
+                Some(m * 60_000 + (sec * 1000.0) as u32)
+            });
+            match ms {
+                Some(ms) => times.push(ms),
+                None => break, // "[ar:Artist]" and the like
+            }
+            rest = r[end + 1..].trim_start();
+        }
+        // Some files also carry per-word times ("<00:19.25>no"): keep only the words.
+        let mut text = String::with_capacity(rest.len());
+        let mut in_tag = false;
+        for ch in rest.chars() {
+            match ch {
+                '<' => in_tag = true,
+                '>' if in_tag => in_tag = false,
+                _ if !in_tag => text.push(ch),
+                _ => {}
+            }
+        }
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for t in times {
+            out.push((t, text.clone()));
+        }
+    }
+    out.sort_by_key(|(t, _)| *t);
+    out
+}
+
+/// Title without the decoration of video uploads: "(Official Video)", "[HD]", "(Remastered 2009)"...
+fn clean_title(t: &str) -> String {
+    let junk = ["official", "video", "lyric", "audio", "visualizer", "remaster", "hd", "4k", "live"];
+    let mut out = String::new();
+    let mut depth = 0;
+    let mut group = String::new();
+    for ch in t.chars() {
+        match ch {
+            '(' | '[' => {
+                depth += 1;
+                group.clear();
+            }
+            ')' | ']' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    let g = group.to_lowercase();
+                    if !junk.iter().any(|j| g.contains(j)) {
+                        out.push('(');
+                        out.push_str(&group);
+                        out.push(')');
+                    }
+                }
+            }
+            _ if depth > 0 => group.push(ch),
+            _ => out.push(ch),
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Synced lyrics from LRCLIB (free, no key). Uses the `curl.exe` that ships with Windows, so no HTTP client
+/// is linked in. Exact lookup first, then a search accepting only results whose length matches the song.
+async fn lrclib_synced(title: &str, artist: &str, secs: u32) -> Option<Vec<(u32, String)>> {
+    async fn get(path: &str, params: &[(&str, String)]) -> Option<serde_json::Value> {
+        let mut c = tokio::process::Command::new("curl.exe");
+        c.args(["-fsSL", "--max-time", "8", "-A", "Temazoo (https://github.com/Fiambre/temazoo)", "-G"])
+            .arg(format!("https://lrclib.net/api/{path}"));
+        for (k, v) in params {
+            c.arg("--data-urlencode").arg(format!("{k}={v}"));
+        }
+        c.creation_flags(0x0800_0000);
+        let out = c.output().await.ok().filter(|o| o.status.success())?;
+        serde_json::from_slice(&out.stdout).ok()
+    }
+    let synced = |v: &serde_json::Value| v["syncedLyrics"].as_str().filter(|s| !s.trim().is_empty()).map(parse_lrc).filter(|l| !l.is_empty());
+    let title = clean_title(title);
+    if title.is_empty() {
+        return None;
+    }
+    let mut exact = vec![("track_name", title.clone()), ("artist_name", artist.to_string())];
+    if secs > 0 {
+        exact.push(("duration", secs.to_string()));
+    }
+    if let Some(l) = get("get", &exact).await.as_ref().and_then(synced) {
+        return Some(l);
+    }
+    // Search: "artist title" first, then the title alone (video uploads carry the channel as artist).
+    for q in [format!("{artist} {title}"), title.clone()] {
+        let Some(v) = get("search", &[("q", q)]).await else { continue };
+        let hit = v.as_array().into_iter().flatten().find(|r| {
+            let ok_len = secs == 0 || r["duration"].as_f64().is_some_and(|d| (d - secs as f64).abs() <= 3.0);
+            ok_len && synced(r).is_some()
+        });
+        if let Some(l) = hit.and_then(synced) {
+            return Some(l);
+        }
+    }
+    None
+}
+
+/// Browse id of the "Lyrics" tab in a `next` response (it starts with "MPLY"), if the song has one.
+fn lyrics_browse_id(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Object(m) => m
+            .get("browseId")
+            .and_then(|b| b.as_str())
+            .filter(|b| b.starts_with("MPLY"))
+            .map(String::from)
+            .or_else(|| m.values().find_map(lyrics_browse_id)),
+        serde_json::Value::Array(a) => a.iter().find_map(lyrics_browse_id),
+        _ => None,
+    }
+}
+
 fn parse_account(v: &serde_json::Value) -> Option<Account> {
     let text = |k: &str| find_key(v, k).and_then(|x| x["runs"][0]["text"].as_str()).unwrap_or("").to_string();
     let name = text("accountName");
@@ -319,6 +501,15 @@ enum Cmd {
     MoreSongs(String, Option<String>),
     Album(String),
     Radio(String),
+    /// Looks up whether the song has a video and, if so, downloads one no taller than the given height
+    /// (the smallest that looks right in the panel); answered with `Evt::Video`.
+    Video(String, u32),
+    /// Higher-resolution video for fullscreen: (song id, wanted height, height already in use).
+    /// Answered with `Evt::VideoHd`; nothing is downloaded when there is no better version.
+    VideoHd(String, u32, u32),
+    /// Lyrics of a song: synced ones from LRCLIB when it has them, else the plain text of YouTube Music.
+    /// (song id, title, artist, seconds); answered with `Evt::Lyrics`.
+    Lyrics(String, String, String, u32),
     Tracks(String),
     Fetch(Track, bool, Quality),
 }
@@ -333,6 +524,11 @@ enum Evt {
     /// (typed text, suggestions)
     Suggest(String, Vec<String>),
     Radio(Vec<Track>),
+    /// Video file for the song, or `None` when it has no video (or it couldn't be fetched).
+    Video(String, Option<PathBuf>),
+    VideoHd(String, Option<PathBuf>),
+    /// Song id and its lyrics, if any.
+    Lyrics(String, Option<Lyrics>),
     /// Exit code of a login/refresh child process (see `login`).
     Session(i32),
     Feed { idx: usize, shelves: Vec<Shelf>, next: Option<String>, first: bool },
@@ -369,6 +565,8 @@ enum Audio {
 #[derive(Default)]
 struct AudioState {
     pos: Duration,
+    /// When `pos` was measured (the video clock needs it: the audio thread only samples it every so often).
+    at: Option<std::time::Instant>,
     total: Duration,
     finished: bool,
     serial: u64,
@@ -445,8 +643,13 @@ fn parse_search_cards(v: &serde_json::Value, kind: Kind) -> Vec<Card> {
             let i = &it["musicResponsiveListItemRenderer"];
             let Some(id) = i["navigationEndpoint"]["browseEndpoint"]["browseId"].as_str() else { continue };
             out.push(Card {
-                kind: if kind == Kind::Artists { CardKind::Artist } else { CardKind::Album },
-                id: id.to_string(),
+                kind: match kind {
+                    Kind::Artists => CardKind::Artist,
+                    Kind::Playlists => CardKind::Playlist,
+                    _ => CardKind::Album,
+                },
+                // Playlist browse ids carry a "VL" prefix that the playlist endpoints don't want.
+                id: if kind == Kind::Playlists { id.strip_prefix("VL").unwrap_or(id).to_string() } else { id.to_string() },
                 title: list_col(i, 0),
                 subtitle: list_col(i, 1),
                 thumb: thumbs_of(&i["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"]).0,
@@ -962,8 +1165,21 @@ fn spawn_backend(ctx: egui::Context, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<E
                     Cmd::Search(q, kind) => {
                         let body = serde_json::json!({ "query": q, "params": kind.params() });
                         match client.send_request("search", body).await {
-                            Ok(v) if kind == Kind::Songs => Evt::Results(q, kind, parse_search(&v), vec![]),
-                            Ok(v) => Evt::Results(q, kind, vec![], parse_search_cards(&v, kind)),
+                            Ok(v) if kind.is_tracks() => Evt::Results(q, kind, parse_search(&v), vec![]),
+                            Ok(v) => {
+                                let mut cards = parse_search_cards(&v, kind);
+                                if kind == Kind::Playlists {
+                                    // Editorial playlists ("YouTube Music") come from a different filter; list them first.
+                                    let body = serde_json::json!({ "query": q, "params": "EgeKAQQoADgBagwQDhAKEAMQBBAJEAU%3D" });
+                                    if let Ok(f) = client.send_request("search", body).await {
+                                        let mut featured = parse_search_cards(&f, kind);
+                                        featured.retain(|c| !cards.iter().any(|x| x.id == c.id));
+                                        featured.extend(cards);
+                                        cards = featured;
+                                    }
+                                }
+                                Evt::Results(q, kind, vec![], cards)
+                            }
                             Err(e) => Evt::Error(format!("búsqueda: {e}")),
                         }
                     }
@@ -1018,6 +1234,80 @@ fn spawn_backend(ctx: egui::Context, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<E
                             Ok(v) => Evt::Tracks(parse_shelf_songs(&v)),
                             Err(e) => Evt::Error(format!("canciones del artista: {e}")),
                         }
+                    }
+                    Cmd::Video(id, max_h) => {
+                        // Songs from the catalogue ("ATV") are audio only: just ask, don't download anything.
+                        let body = serde_json::json!({ "videoId": id, "isAudioOnly": true });
+                        let has_video = match client.send_request("next", body).await {
+                            Ok(v) => find_key(&v, "musicVideoType")
+                                .and_then(|t| t.as_str())
+                                .is_some_and(|t| matches!(t, "MUSIC_VIDEO_TYPE_OMV" | "MUSIC_VIDEO_TYPE_UGC" | "MUSIC_VIDEO_TYPE_OFFICIAL_SOURCE_MUSIC")),
+                            Err(_) => false,
+                        };
+                        let path = cache_dir().join(format!("{id}.video.mp4"));
+                        // Keep only the current video on disk (they are big).
+                        if let Ok(rd) = std::fs::read_dir(cache_dir()) {
+                            let mine = format!("{id}.");
+                            for f in rd.flatten().filter(|f| {
+                                let n = f.file_name().to_string_lossy().to_string();
+                                (n.ends_with(".video.mp4") || n.ends_with(".video.mp4.part")) && !n.starts_with(&mine)
+                            }) {
+                                let _ = std::fs::remove_file(f.path());
+                            }
+                        }
+                        if has_video && !path.exists() {
+                            let mut c = tokio::process::Command::new(ytdlp_path());
+                            c.args(["-f", &format!("bv*[vcodec^=avc1][height<={max_h}]/worst[vcodec^=avc1]"), "--no-playlist", "-q", "--no-warnings", "-o"])
+                                .arg(cache_dir().join(format!("{id}.video.%(ext)s")))
+                                .arg(format!("https://music.youtube.com/watch?v={id}"));
+                            #[cfg(windows)]
+                            c.creation_flags(0x08000000);
+                            let _ = c.output().await;
+                        }
+                        Evt::Video(id, (has_video && path.exists()).then_some(path))
+                    }
+                    Cmd::Lyrics(id, title, artist, secs) => {
+                        // Synced lyrics first (LRCLIB). Otherwise the plain text YouTube Music keeps behind a tab
+                        // of the "next" response: find its browse id, then fetch it.
+                        let found = if let Some(lines) = lrclib_synced(&title, &artist, secs).await {
+                            Some(Lyrics::Synced { lines, source: "LRCLIB".into() })
+                        } else {
+                            async {
+                                let n = client.send_request("next", serde_json::json!({ "videoId": id, "isAudioOnly": true })).await.ok()?;
+                                let browse = lyrics_browse_id(&n)?;
+                                let l = client.send_request("browse", serde_json::json!({ "browseId": browse })).await.ok()?;
+                                let shelf = find_key(&l, "musicDescriptionShelfRenderer")?;
+                                let text = runs(&shelf["description"]);
+                                let source = runs(&shelf["footer"]).trim_start_matches("Source: ").to_string();
+                                (!text.trim().is_empty()).then_some(Lyrics::Plain { text, source })
+                            }
+                            .await
+                        };
+                        Evt::Lyrics(id, found)
+                    }
+                    Cmd::VideoHd(id, want, have) => {
+                        let sel = format!("bv*[vcodec^=avc1][height<={}]", want.clamp(240, 1080));
+                        let url = format!("https://music.youtube.com/watch?v={id}");
+                        // Ask yt-dlp which height that selector gives (no download) and only fetch if it is better.
+                        let mut c = tokio::process::Command::new(ytdlp_path());
+                        c.args(["-f", &sel, "--no-playlist", "-q", "--no-warnings", "--print", "%(height)s", &url]);
+                        #[cfg(windows)]
+                        c.creation_flags(0x08000000);
+                        let best: u32 = match c.output().await {
+                            Ok(o) => String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0),
+                            Err(_) => 0,
+                        };
+                        let path = cache_dir().join(format!("{id}.hd{best}.video.mp4"));
+                        if best > have && !path.exists() {
+                            let mut c = tokio::process::Command::new(ytdlp_path());
+                            c.args(["-f", &sel, "--no-playlist", "-q", "--no-warnings", "-o"])
+                                .arg(cache_dir().join(format!("{id}.hd{best}.video.%(ext)s")))
+                                .arg(&url);
+                            #[cfg(windows)]
+                            c.creation_flags(0x08000000);
+                            let _ = c.output().await;
+                        }
+                        Evt::VideoHd(id, (best > have && path.exists()).then_some(path))
                     }
                     Cmd::Radio(id) => {
                         let body = serde_json::json!({ "videoId": id, "playlistId": format!("RDAMVM{id}"), "isAudioOnly": true });
@@ -1112,7 +1402,7 @@ fn spawn_audio(rx: mpsc::Receiver<Audio>, state: Arc<Mutex<AudioState>>) {
         let mut loaded = false;
         let mut vol = 0.7f32;
         loop {
-            match rx.recv_timeout(Duration::from_millis(200)) {
+            match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(Audio::Load(p)) => {
                     player.clear();
                     let mut total = Duration::ZERO;
@@ -1156,6 +1446,7 @@ fn spawn_audio(rx: mpsc::Receiver<Audio>, state: Arc<Mutex<AudioState>>) {
             }
             let mut s = state.lock().unwrap();
             s.pos = player.get_pos();
+            s.at = Some(std::time::Instant::now());
             if loaded && player.empty() {
                 s.finished = true;
                 loaded = false;
@@ -1231,6 +1522,80 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, size: f32, filled: bool) -> egui::
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum SettingsTab {
+    Playback,
+    Video,
+    Lyrics,
+    Account,
+    Storage,
+    About,
+}
+
+/// Left-hand navigation entry of the settings window.
+fn nav_item(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
+    if active {
+        ui.painter().rect_filled(rect, 8.0, Color32::from_rgba_unmultiplied(167, 139, 250, 36));
+    } else if resp.hovered() {
+        ui.painter().rect_filled(rect, 8.0, Color32::from_white_alpha(10));
+    }
+    ui.painter().text(
+        rect.left_center() + egui::vec2(12.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(14.5),
+        if active { ACCENT } else { Color32::from_gray(210) },
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn page_title(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(text).strong().size(20.0));
+    ui.add_space(10.0);
+}
+
+/// A rounded block that groups related settings.
+fn settings_card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new().fill(Color32::from_gray(24)).corner_radius(10.0).inner_margin(egui::Margin::symmetric(14, 12)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        add(ui);
+    });
+    ui.add_space(12.0);
+}
+
+fn card_divider(ui: &mut egui::Ui) {
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(8.0);
+}
+
+/// "Title + explanation" on the left, the control on the right.
+fn setting_row(ui: &mut egui::Ui, title: &str, desc: &str, control: impl FnOnce(&mut egui::Ui)) {
+    // Title on the left and the control on the right; the explanation goes below, using the full width,
+    // so a wide control (four buttons) never collides with it.
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(title).size(14.5));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control);
+    });
+    if !desc.is_empty() {
+        ui.add(egui::Label::new(egui::RichText::new(desc).color(DIM).size(12.0)).wrap());
+    }
+}
+
+/// A row of exclusive options. Returns the newly picked index. (Drawn right to left, so it is added
+/// in reverse to read left to right inside `setting_row`.)
+fn segmented(ui: &mut egui::Ui, options: &[&str], selected: usize) -> Option<usize> {
+    let mut pick = None;
+    for (i, o) in options.iter().enumerate().rev() {
+        if chip(ui, o, i == selected).clicked() && i != selected {
+            pick = Some(i);
+        }
+    }
+    pick
+}
+
 fn switch(ui: &mut egui::Ui, on: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(34.0, 18.0), egui::Sense::click());
     ui.painter().rect_filled(rect, 9.0, if on { ACCENT } else { Color32::from_gray(70) });
@@ -1254,6 +1619,109 @@ fn row_menu_trigger(ui: &mut egui::Ui, rect: egui::Rect, row: &egui::Response) -
         return row.interact_pointer_pos();
     }
     None
+}
+
+/// Four corner brackets: pointing outwards to enter fullscreen, inwards to leave it.
+fn fs_glyph(p: &egui::Painter, c: egui::Pos2, col: Color32, exit: bool) {
+    let s = egui::Stroke::new(1.8, col);
+    let a = 5.0; // arm length
+    for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+        if exit {
+            // Brackets near the centre with the arms pointing outwards.
+            let corner = egui::pos2(c.x + sx * 3.0, c.y + sy * 3.0);
+            p.line_segment([corner, egui::pos2(corner.x + sx * a, corner.y)], s);
+            p.line_segment([corner, egui::pos2(corner.x, corner.y + sy * a)], s);
+        } else {
+            // Brackets in the four outer corners, arms along the edges.
+            let corner = egui::pos2(c.x + sx * 7.0, c.y + sy * 7.0);
+            p.line_segment([corner, egui::pos2(corner.x - sx * a, corner.y)], s);
+            p.line_segment([corner, egui::pos2(corner.x, corner.y - sy * a)], s);
+        }
+    }
+}
+
+fn fs_button(ui: &mut egui::Ui, on: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+    let col = if on { ACCENT } else if resp.hovered() { Color32::WHITE } else { Color32::from_gray(170) };
+    fs_glyph(ui.painter(), rect.center(), col, on);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RightTab {
+    Queue,
+    Lyrics,
+}
+
+enum Lyrics {
+    Loading,
+    /// Plain text (YouTube Music).
+    Plain { text: String, source: String },
+    /// Lines with their start time in ms (LRCLIB), to follow the song.
+    Synced { lines: Vec<(u32, String)>, source: String },
+    Missing,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Repeat {
+    Off,
+    All,
+    One,
+}
+
+/// Crossed arrows. Lit when shuffle is on.
+fn shuffle_button(ui: &mut egui::Ui, on: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+    let col = if on { ACCENT } else if resp.hovered() { Color32::WHITE } else { Color32::from_gray(150) };
+    let (c, p) = (rect.center(), ui.painter());
+    let s = egui::Stroke::new(1.8, col);
+    let (l, r, t, b) = (c.x - 8.0, c.x + 6.0, c.y - 5.0, c.y + 5.0);
+    p.line_segment([egui::pos2(l, t), egui::pos2(c.x - 2.0, t)], s);
+    p.line_segment([egui::pos2(c.x - 2.0, t), egui::pos2(c.x + 2.0, b)], s);
+    p.line_segment([egui::pos2(c.x + 2.0, b), egui::pos2(r, b)], s);
+    p.line_segment([egui::pos2(l, b), egui::pos2(c.x - 2.0, b)], s);
+    p.line_segment([egui::pos2(c.x - 2.0, b), egui::pos2(c.x + 2.0, t)], s);
+    p.line_segment([egui::pos2(c.x + 2.0, t), egui::pos2(r, t)], s);
+    for y in [t, b] {
+        p.add(egui::Shape::convex_polygon(
+            vec![egui::pos2(r + 4.0, y), egui::pos2(r - 1.0, y - 3.0), egui::pos2(r - 1.0, y + 3.0)],
+            col,
+            egui::Stroke::NONE,
+        ));
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Loop arrows; a "1" inside for repeat-one. Lit when repeating.
+fn repeat_button(ui: &mut egui::Ui, mode: Repeat) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+    let on = mode != Repeat::Off;
+    let col = if on { ACCENT } else if resp.hovered() { Color32::WHITE } else { Color32::from_gray(150) };
+    let (c, p) = (rect.center(), ui.painter());
+    let s = egui::Stroke::new(1.8, col);
+    let (l, r, t, b) = (c.x - 8.0, c.x + 8.0, c.y - 5.5, c.y + 5.5);
+    p.line_segment([egui::pos2(l + 2.0, t), egui::pos2(r - 2.0, t)], s);
+    p.line_segment([egui::pos2(r - 2.0, t), egui::pos2(r, t + 2.0)], s);
+    p.line_segment([egui::pos2(r, t + 2.0), egui::pos2(r, b - 2.0)], s);
+    p.line_segment([egui::pos2(l + 2.0, b), egui::pos2(r - 2.0, b)], s);
+    p.line_segment([egui::pos2(l, b - 2.0), egui::pos2(l + 2.0, b)], s);
+    p.line_segment([egui::pos2(l, t + 2.0), egui::pos2(l, b - 2.0)], s);
+    p.line_segment([egui::pos2(l, t + 2.0), egui::pos2(l + 2.0, t)], s);
+    // arrow heads on the top-right and bottom-left corners
+    p.add(egui::Shape::convex_polygon(
+        vec![egui::pos2(r - 6.0, t - 3.5), egui::pos2(r - 6.0, t + 3.5), egui::pos2(r - 1.5, t)],
+        col,
+        egui::Stroke::NONE,
+    ));
+    p.add(egui::Shape::convex_polygon(
+        vec![egui::pos2(l + 6.0, b - 3.5), egui::pos2(l + 6.0, b + 3.5), egui::pos2(l + 1.5, b)],
+        col,
+        egui::Stroke::NONE,
+    ));
+    if mode == Repeat::One {
+        p.text(c, egui::Align2::CENTER_CENTER, "1", egui::FontId::proportional(10.0), col);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn queue_button(ui: &mut egui::Ui, active: bool) -> egui::Response {
@@ -1528,6 +1996,7 @@ struct Menu {
 }
 
 enum Act {
+    StartRadio(Track),
     PlayNext(Track),
     Enqueue(Track),
     QJump(usize),
@@ -1596,6 +2065,8 @@ struct App {
     show_queue: bool,
     autoplay: bool,
     radio_pending: bool,
+    /// The pending radio was asked for explicitly ("Iniciar radio"), so it applies even with suggestions off.
+    radio_force: bool,
     want_next: bool,
     /// A song was requested and is still being downloaded.
     loading: bool,
@@ -1606,9 +2077,53 @@ struct App {
     playing: bool,
     paused: bool,
     expected_serial: u64,
+    /// Video shown full-window (the app goes fullscreen with it); `vfull_app_was_fs` = it already was.
+    video_full: bool,
+    vfull_app_was_fs: bool,
+    vfull_seen_fs: bool,
+    /// Debug panel over the fullscreen video, and what it shows (refreshed about once a second).
+    vfull_debug: bool,
+    /// Lyrics over the fullscreen video (toggled from its context menu).
+    vfull_lyrics: bool,
+    /// Lyrics settings (Configuración): style, lines in the overlay, and whether fullscreen starts with them on.
+    lyr_style: LyricsStyle,
+    lyr_lines: u8,
+    lyr_default_on: bool,
+    /// Highest video height used in fullscreen (480/720/1080; 0 = the screen's, up to 1080).
+    fs_quality: u32,
+    settings_tab: SettingsTab,
+    dbg_at: std::time::Instant,
+    dbg_shown: u64,
+    dbg_fps: f32,
+    dbg_mem: u64,
+    dbg_file: f32,
+    shuffle: bool,
+    /// Queue order before shuffling, to restore it when shuffle is turned off.
+    pre_shuffle: Vec<String>,
+    rng: u64,
+    repeat: Repeat,
     volume: f32,
     quality: Quality,
     prefetch: bool,
+    /// Saved default of "show video when the song has one" (Configuración).
+    video_default: bool,
+    /// Current state of that switch (the Cola can flip it for this session). Off = nothing video-related loads.
+    show_video: bool,
+    video: Option<video::Video>,
+    video_tex: Option<egui::TextureHandle>,
+    /// Right panel: the queue or the lyrics of the current song.
+    right_tab: RightTab,
+    /// Lyrics of the song being shown: (song id, state). Only fetched while the Letra tab is open.
+    lyrics: Option<(String, Lyrics)>,
+    /// Line of the synced lyrics last scrolled to (so the view only moves when the line changes).
+    lyr_line: usize,
+    /// Screen scale (physical pixels per point), kept to size the video request.
+    ppp: f32,
+    /// Files of the current song: normal quality, and the higher one fetched for fullscreen.
+    video_sd: Option<PathBuf>,
+    video_hd: Option<PathBuf>,
+    video_hd_active: bool,
+    video_hd_asked: bool,
     show_settings: bool,
     cache_bytes: u64,
     query: String,
@@ -1713,6 +2228,7 @@ impl App {
             show_queue: false,
             autoplay: load_autoplay(),
             radio_pending: false,
+            radio_force: false,
             want_next: false,
             loading: false,
             drag_from: None,
@@ -1721,9 +2237,40 @@ impl App {
             playing: false,
             paused: false,
             expected_serial: 0,
+            video_full: false,
+            vfull_app_was_fs: false,
+            vfull_seen_fs: false,
+            vfull_debug: false,
+            vfull_lyrics: load_lyrics_cfg().2,
+            lyr_style: load_lyrics_cfg().0,
+            lyr_lines: load_lyrics_cfg().1,
+            lyr_default_on: load_lyrics_cfg().2,
+            fs_quality: load_fs_quality(),
+            settings_tab: SettingsTab::Playback,
+            dbg_at: std::time::Instant::now(),
+            dbg_shown: 0,
+            dbg_fps: 0.0,
+            dbg_mem: 0,
+            dbg_file: 0.0,
+            shuffle: false,
+            pre_shuffle: Vec::new(),
+            rng: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0x9E37_79B9, |d| d.as_nanos() as u64) | 1,
+            repeat: Repeat::Off,
             volume: 0.7,
             quality: Quality::load(),
             prefetch: load_prefetch(),
+            video_default: load_video(),
+            show_video: load_video(),
+            video: None,
+            video_tex: None,
+            right_tab: RightTab::Queue,
+            lyrics: None,
+            lyr_line: usize::MAX,
+            ppp: 1.0,
+            video_sd: None,
+            video_hd: None,
+            video_hd_active: false,
+            video_hd_asked: false,
             show_settings: false,
             cache_bytes: 0,
             query: String::new(),
@@ -1848,8 +2395,56 @@ impl App {
 
     /// Starts the song picked in the visible list: the queue becomes that list.
     fn play_index(&mut self, i: usize) {
-        self.queue = self.tracks.clone();
-        self.play_queue(i);
+        let q = self.tracks.clone();
+        self.start_queue(q, i);
+    }
+
+    /// Replaces the queue and plays `pos`. With shuffle on, that song goes first and the rest is mixed.
+    fn start_queue(&mut self, q: Vec<Track>, pos: usize) {
+        self.queue = q;
+        self.pre_shuffle.clear();
+        let mut pos = pos;
+        if self.shuffle && !self.queue.is_empty() {
+            self.pre_shuffle = self.queue.iter().map(|t| t.id.clone()).collect();
+            let first = self.queue.remove(pos.min(self.queue.len() - 1));
+            self.shuffle_slice(0);
+            self.queue.insert(0, first);
+            pos = 0;
+        }
+        self.play_queue(pos);
+    }
+
+    fn next_rand(&mut self) -> u64 {
+        // xorshift64: good enough to mix a playlist, no extra dependency.
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        x
+    }
+
+    /// Fisher-Yates over `queue[from..]`.
+    fn shuffle_slice(&mut self, from: usize) {
+        let n = self.queue.len();
+        for i in (from + 1..n).rev() {
+            let j = from + (self.next_rand() % (i - from + 1) as u64) as usize;
+            self.queue.swap(i, j);
+        }
+    }
+
+    /// Turns shuffle on (mixes what is left in the queue) or off (restores the original order of it).
+    fn set_shuffle(&mut self, on: bool) {
+        self.shuffle = on;
+        let from = self.qpos.map_or(0, |p| p + 1).min(self.queue.len());
+        if on {
+            self.pre_shuffle = self.queue.iter().map(|t| t.id.clone()).collect();
+            self.shuffle_slice(from);
+        } else {
+            let order = std::mem::take(&mut self.pre_shuffle);
+            let idx = |t: &Track| order.iter().position(|id| *id == t.id).unwrap_or(usize::MAX);
+            self.queue[from..].sort_by_key(idx);
+        }
     }
 
     fn play_queue(&mut self, pos: usize) {
@@ -1860,6 +2455,11 @@ impl App {
         }
         self.now = Some(t.clone());
         self.want = Some(t.id.clone());
+        // Video: drop the previous one right away; look up the new one only when the setting is on.
+        self.video_reset();
+        if self.show_video {
+            let _ = self.cmd.send(Cmd::Video(t.id.clone(), self.panel_video_height()));
+        }
         self.playing = false;
         self.paused = false;
         self.want_next = false;
@@ -1869,6 +2469,230 @@ impl App {
         let _ = self.audio.send(Audio::Fade);
         let _ = self.cmd.send(Cmd::Fetch(t.clone(), false, self.quality));
         self.ensure_suggestions();
+    }
+
+    /// Writes every setting to `config.json`.
+    fn save_settings(&self) {
+        save_config(self.quality, self.prefetch, self.autoplay, self.video_default, (self.lyr_style, self.lyr_lines, self.lyr_default_on), self.fs_quality);
+    }
+
+    /// Turns the video on or off for now. Off drops the decoder thread and texture right away.
+    /// Lines of the fullscreen debug panel. `screen` is the video area in physical pixels.
+    /// Memory and file size are refreshed about once a second (they are not free to query).
+    fn debug_lines(&mut self, screen: egui::Vec2) -> Vec<String> {
+        let Some(v) = &self.video else {
+            // No video for this song: the cover is shown instead.
+            let pos = self.state.lock().unwrap().pos.as_secs();
+            return vec![
+                "Video      ninguno para esta canción (se muestra la carátula)".to_string(),
+                format!("Pantalla   {}x{} px", screen.x as u32, screen.y as u32),
+                format!("Audio      {}  posición {}:{:02}", if self.quality == Quality::Opus { "Opus" } else { "AAC" }, pos / 60, pos % 60),
+                format!("Memoria    {} MB (toda la app)", process_mem_mb().unwrap_or(0)),
+            ];
+        };
+        let st = v.stats();
+        let secs = self.dbg_at.elapsed().as_secs_f32();
+        if secs >= 1.0 {
+            self.dbg_fps = st.shown.saturating_sub(self.dbg_shown) as f32 / secs;
+            self.dbg_shown = st.shown;
+            self.dbg_at = std::time::Instant::now();
+            self.dbg_mem = process_mem_mb().unwrap_or(0);
+            let file = if self.video_hd_active { &self.video_hd } else { &self.video_sd };
+            self.dbg_file = file.as_ref().and_then(|p| std::fs::metadata(p).ok()).map_or(0.0, |m| m.len() as f32 / 1_048_576.0);
+        }
+        let (tw, th) = self.video_tex.as_ref().map_or((0.0, 0.0), |t| (t.size()[0] as f32, t.size()[1] as f32));
+        let scale = if tw > 0.0 && th > 0.0 { (screen.x / tw).min(screen.y / th) } else { 0.0 };
+        let pos = self.state.lock().unwrap().pos.as_secs();
+        vec![
+            format!("Video      {}x{}  H.264  {}", tw as u32, th as u32, if self.video_hd_active { "alta resolución" } else { "resolución normal" }),
+            format!("Archivo    {:.1} MB{}", self.dbg_file, if self.video_hd_asked && !self.video_hd_active && self.video_hd.is_none() { "  (buscando mejor versión...)" } else { "" }),
+            format!("Pantalla   {}x{} px  (video a x{:.2})", screen.x as u32, screen.y as u32, scale),
+            format!("Cuadros    {:.1}/s  mostrados {}  descartados {}", self.dbg_fps, st.shown, st.dropped),
+            format!("Decodifica {:.1} ms/cuadro  color {:.1} ms", st.decode_ms, st.convert_ms),
+            format!("Sincronía  {:+} ms respecto al audio", st.sync_ms),
+            format!("Audio      {}  posición {}:{:02}", if self.quality == Quality::Opus { "Opus" } else { "AAC" }, pos / 60, pos % 60),
+            format!("Memoria    {} MB (toda la app)", self.dbg_mem),
+        ]
+    }
+
+    /// The lyrics of the current song: synced (highlighting the line that is playing, click to jump) or plain.
+    /// Used in the queue panel and, with `big`, over the fullscreen video.
+    fn lyrics_ui(&self, ui: &mut egui::Ui, now_ms: u32, big: bool, seek_to: &mut Option<u32>, new_line: &mut usize) {
+        let (size, size_cur, size_plain, note) = if big { (24.0, 30.0, 22.0, 14.0) } else { (16.0, 18.0, 15.0, 11.5) };
+        let salt = if big { "lyrics_full" } else { "lyrics_panel" };
+        match (&self.now, &self.lyrics) {
+            (None, _) => {
+                ui.label(egui::RichText::new("Poné una canción para ver su letra.").color(DIM).size(13.0));
+            }
+            (_, Some((_, Lyrics::Synced { lines, source }))) => {
+                // The current line is the last one whose time has passed.
+                let cur = lines.partition_point(|(t, _)| *t <= now_ms).checked_sub(1);
+                let scroll_now = cur.is_some_and(|c| c != self.lyr_line) || self.lyr_line == usize::MAX;
+                egui::ScrollArea::vertical().id_salt(salt).auto_shrink([false, false]).show(ui, |ui| {
+                    ui.add_space(8.0);
+                    for (i, (t, text)) in lines.iter().enumerate() {
+                        let is_cur = Some(i) == cur;
+                        let col = if is_cur {
+                            Color32::WHITE
+                        } else if cur.is_some_and(|c| i < c) {
+                            Color32::from_gray(105)
+                        } else {
+                            Color32::from_gray(165)
+                        };
+                        let label = if text.is_empty() { "· · ·".to_string() } else { text.clone() };
+                        let mut rt = egui::RichText::new(label).size(if is_cur { size_cur } else { size }).color(col);
+                        if is_cur {
+                            rt = rt.strong();
+                        }
+                        let r = ui.add(egui::Label::new(rt).wrap().sense(egui::Sense::click()));
+                        if r.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        // Click a line to jump to it.
+                        if r.clicked() {
+                            *seek_to = Some(*t);
+                        }
+                        if is_cur && scroll_now {
+                            r.scroll_to_me(Some(egui::Align::Center));
+                            *new_line = i;
+                        }
+                        ui.add_space(if big { 12.0 } else { 8.0 });
+                    }
+                    ui.add_space(14.0);
+                    ui.label(egui::RichText::new(format!("Fuente: {source}  ·  clic en una línea para saltar")).color(DIM).size(note));
+                    ui.add_space(if big { 300.0 } else { 120.0 });
+                });
+                // Keep the highlight moving between the app's normal redraws.
+                ui.ctx().request_repaint_after(Duration::from_millis(120));
+            }
+            (_, Some((_, Lyrics::Plain { text, source }))) => {
+                egui::ScrollArea::vertical().id_salt(salt).auto_shrink([false, false]).show(ui, |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(text).size(size_plain).color(Color32::from_gray(225))).wrap());
+                    if !source.is_empty() {
+                        ui.add_space(14.0);
+                        ui.label(egui::RichText::new(format!("Fuente: {source}")).color(DIM).size(note));
+                    }
+                });
+            }
+            (_, Some((_, Lyrics::Missing))) => {
+                ui.label(egui::RichText::new("No hay letra para esta canción.").color(DIM).size(13.0));
+            }
+            _ => {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(14.0).color(ACCENT));
+                    ui.label(egui::RichText::new("Buscando letra...").color(DIM).size(13.0));
+                });
+            }
+        }
+    }
+
+    /// Synced lyrics over the picture: a few lines at the bottom, the current one bright and the rest fading
+    /// with distance. When the line changes they glide up instead of jumping (a short eased transition).
+    fn lyrics_overlay(&self, ctx: &egui::Context, painter: &egui::Painter, media: egui::Rect, now_ms: u32) {
+        let Some((_, Lyrics::Synced { lines, .. })) = &self.lyrics else { return };
+        let cur = lines.partition_point(|(t, _)| *t <= now_ms).checked_sub(1);
+        // Fractional index of the line in the "focus": it moves from the previous line to the current one
+        // over 350 ms after the current one starts.
+        let since = cur.map_or(u32::MAX, |c| now_ms.saturating_sub(lines[c].0));
+        let t = (since as f32 / 350.0).min(1.0);
+        let ease = t * t * (3.0 - 2.0 * t);
+        let focus = cur.map_or(-1.0, |c| c as f32 - 1.0 + ease);
+        ctx.request_repaint_after(Duration::from_millis(if since < 400 { 16 } else { 120 }));
+
+        let half = (self.lyr_lines / 2) as f32;
+        let size = (media.height() * 0.05).clamp(20.0, 64.0);
+        let slot = size * 1.75;
+        let center_y = media.bottom() - media.height() * 0.13 - half * slot;
+        // A soft dark band behind the text so it reads over any picture.
+        let band_h = (half * 2.0 + 2.5) * slot;
+        const STRIPS: usize = 14;
+        for k in 0..STRIPS {
+            let y0 = media.bottom() - band_h + band_h * k as f32 / STRIPS as f32;
+            let a = (150.0 * (k + 1) as f32 / STRIPS as f32) as u8;
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(media.left(), y0), egui::pos2(media.right(), y0 + band_h / STRIPS as f32 + 1.0)),
+                0.0,
+                Color32::from_black_alpha(a),
+            );
+        }
+        let first = (focus - half - 1.0).floor().max(0.0) as usize;
+        let last = ((focus + half + 1.0).ceil().max(0.0) as usize).min(lines.len().saturating_sub(1));
+        for i in first..=last {
+            let text = &lines[i].1;
+            if text.is_empty() {
+                continue;
+            }
+            let d = i as f32 - focus;
+            // Opaque at the focus, fading to nothing just beyond the visible lines.
+            let a = (1.0 - d.abs() / (half + 1.0)).clamp(0.0, 1.0).powf(1.5);
+            if a < 0.02 {
+                continue;
+            }
+            let sz = size * (1.0 - 0.18 * d.abs().min(1.0));
+            let wrap = media.width() * 0.8;
+            let fg = painter.layout(text.clone(), egui::FontId::proportional(sz), Color32::from_white_alpha((255.0 * a) as u8), wrap);
+            let shadow = painter.layout(text.clone(), egui::FontId::proportional(sz), Color32::from_black_alpha((200.0 * a) as u8), wrap);
+            let pos = egui::pos2(media.center().x - fg.size().x / 2.0, center_y + d * slot - fg.size().y / 2.0);
+            painter.galley(pos + egui::vec2(2.0, 2.0), shadow, Color32::BLACK);
+            painter.galley(pos, fg, Color32::WHITE);
+        }
+    }
+
+    /// Tallest video worth fetching for the queue panel: its width in real pixels at 16:9, rounded up to
+    /// a size YouTube serves. Anything bigger would only cost memory and bandwidth.
+    fn panel_video_height(&self) -> u32 {
+        let px_w = 306.0 * self.ppp;
+        let h = px_w * 9.0 / 16.0;
+        if h <= 240.0 {
+            240
+        } else if h <= 360.0 {
+            360
+        } else {
+            480
+        }
+    }
+
+    /// Drops the decoder, its texture and everything remembered about the current song's video.
+    fn video_reset(&mut self) {
+        self.video = None;
+        self.video_tex = None;
+        self.video_sd = None;
+        self.video_hd = None;
+        self.video_hd_active = false;
+        self.video_hd_asked = false;
+    }
+
+    /// (Re)starts the decoder on `path`, jumping to where the song is now.
+    fn start_video_file(&mut self, ctx: &egui::Context, path: PathBuf) {
+        let (pos, at) = {
+            let s = self.state.lock().unwrap();
+            (s.pos, s.at)
+        };
+        let running = self.playing && !self.paused;
+        // The audio position is a sample taken a moment ago: add the time since.
+        let pos = if running { pos + at.map_or(Duration::ZERO, |t| t.elapsed()) } else { pos };
+        let c = ctx.clone();
+        self.video = Some(video::Video::start(path, pos, running, move || c.request_repaint()));
+    }
+
+    /// Switches between the normal and the high-resolution file (the latter is used in fullscreen).
+    fn use_video_hd(&mut self, ctx: &egui::Context, hd: bool) {
+        let path = if hd { self.video_hd.clone() } else { self.video_sd.clone() };
+        if let Some(p) = path.filter(|_| self.video.is_some() && self.video_hd_active != hd) {
+            self.start_video_file(ctx, p);
+            self.video_hd_active = hd;
+        }
+    }
+
+    fn set_video(&mut self, on: bool) {
+        self.show_video = on;
+        if on {
+            if let Some(id) = self.want.clone().filter(|_| self.now.is_some()) {
+                let _ = self.cmd.send(Cmd::Video(id, self.panel_video_height()));
+            }
+        } else {
+            self.video_reset();
+        }
     }
 
     fn toggle_pause(&mut self) {
@@ -1884,6 +2708,10 @@ impl App {
         let j = p as isize + delta;
         if (0..self.queue.len() as isize).contains(&j) {
             self.play_queue(j as usize);
+            true
+        } else if self.repeat == Repeat::All && !self.queue.is_empty() {
+            // Repeat all: wrap around.
+            self.play_queue(if delta > 0 { 0 } else { self.queue.len() - 1 });
             true
         } else {
             false
@@ -1914,6 +2742,16 @@ impl App {
 
     fn act(&mut self, a: Act) {
         match a {
+            Act::StartRadio(t) => {
+                // Replace the queue with this song and let its radio fill the rest.
+                let id = t.id.clone();
+                self.queue = vec![t];
+                self.radio_pending = true;
+                self.radio_force = true;
+                self.play_queue(0);
+                let _ = self.cmd.send(Cmd::Radio(id));
+                self.status = "Iniciando radio...".into();
+            }
             Act::PlayNext(t) => self.enqueue(t, true),
             Act::Enqueue(t) => self.enqueue(t, false),
             Act::QJump(i) => self.play_queue(i),
@@ -2124,8 +2962,9 @@ impl eframe::App for App {
                 }
                 Evt::Radio(mut t) => {
                     self.radio_pending = false;
+                    let forced = std::mem::take(&mut self.radio_force);
                     t.retain(|s| !self.queue.iter().any(|q| q.id == s.id));
-                    if self.autoplay && !t.is_empty() {
+                    if (self.autoplay || forced) && !t.is_empty() {
                         self.queue.extend(t);
                         if self.want_next {
                             self.step(1);
@@ -2142,6 +2981,30 @@ impl eframe::App for App {
                         if let Some(n) = self.qpos.and_then(|i| self.queue.get(i + 1)).cloned().filter(|_| self.prefetch) {
                             let _ = self.cmd.send(Cmd::Fetch(n, true, self.quality));
                         }
+                    }
+                }
+                Evt::Video(id, Some(path)) => {
+                    if self.show_video && self.want.as_deref() == Some(id.as_str()) {
+                        self.video_sd = Some(path.clone());
+                        self.start_video_file(&ctx, path);
+                        // The video is shown inside the queue panel, so open it.
+                        self.show_queue = true;
+                    }
+                }
+                Evt::Video(..) => {}
+                Evt::VideoHd(id, Some(path)) => {
+                    if self.show_video && self.want.as_deref() == Some(id.as_str()) {
+                        self.video_hd = Some(path);
+                        if self.video_full {
+                            self.use_video_hd(&ctx, true);
+                        }
+                    }
+                }
+                Evt::VideoHd(..) => {}
+                Evt::Lyrics(id, found) => {
+                    if self.lyrics.as_ref().is_some_and(|(cur, _)| *cur == id) {
+                        self.lyrics = Some((id, found.unwrap_or(Lyrics::Missing)));
+                        self.lyr_line = usize::MAX;
                     }
                 }
                 Evt::Prefetched => {}
@@ -2194,6 +3057,14 @@ impl eframe::App for App {
         };
         if self.playing && finished {
             self.playing = false;
+            // Repeat one: play the same song again.
+            if self.repeat == Repeat::One {
+                if let Some(p) = self.qpos {
+                    self.play_queue(p);
+                    ctx.request_repaint();
+                    return;
+                }
+            }
             // Nothing left: wait for suggestions if they are on (and ask for them if not yet requested).
             if !self.step(1) && self.autoplay {
                 self.want_next = true;
@@ -2214,9 +3085,9 @@ impl eframe::App for App {
         }
         // Rows that react to clicks set this; the hand cursor is applied last so nothing overrides it.
         let mut hand = false;
-        let (pos, total_audio) = {
+        let (pos, pos_at, total_audio) = {
             let s = self.state.lock().unwrap();
-            (s.pos, s.total.as_secs() as u32)
+            (s.pos, s.at, s.total.as_secs() as u32)
         };
         let cur = self.now.clone();
         // Keyboard: Space pauses/resumes (unless typing); Ctrl+Left/Right = previous/next.
@@ -2249,6 +3120,72 @@ impl eframe::App for App {
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
             self.focus_search = true;
         }
+        // Fullscreen: F11 toggles the whole app; Esc leaves it (or the fullscreen video first).
+        let app_fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let mut toggle_app_fs = ctx.input(|i| i.key_pressed(egui::Key::F11));
+        if app_fs && !self.video_full && !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            toggle_app_fs = true;
+        }
+        let mut enter_vfull = false;
+        // Leaves on Esc, or when there is nothing playing or the video setting was turned off.
+        let mut exit_vfull = self.video_full && (self.now.is_none() || !self.show_video || ctx.input(|i| i.key_pressed(egui::Key::Escape)));
+        // Leaving the app's fullscreen (F11, the bar button, the window) also puts the video back in its place.
+        // `vfull_seen_fs` avoids reacting before the window has actually gone fullscreen.
+        if self.video_full {
+            if app_fs {
+                self.vfull_seen_fs = true;
+            } else if self.vfull_seen_fs {
+                exit_vfull = true;
+            }
+        }
+
+        // ---- video (only exists while the setting is on and the song has one) ----
+        // The video lives at the top of the queue panel (or fills the window in fullscreen). While it is
+        // not on screen the decoder, its buffers and the texture are released entirely; they come back
+        // (jumping to the current position) as soon as it is visible again.
+        self.ppp = ctx.pixels_per_point();
+        let video_visible = self.show_queue || self.video_full;
+        if self.show_video && !video_visible && self.video.is_some() {
+            self.video = None;
+            self.video_tex = None;
+            self.video_hd_active = false;
+        } else if self.show_video && video_visible && self.video.is_none() {
+            let hd = self.video_full && self.video_hd.is_some();
+            if let Some(p) = if hd { self.video_hd.clone() } else { self.video_sd.clone() } {
+                self.start_video_file(&ctx, p);
+                self.video_hd_active = hd;
+            }
+        }
+        // Fullscreen wants a higher resolution than the panel. Checked every frame (not just when entering):
+        // the small video may arrive after fullscreen was entered, and the big one after that.
+        if self.video_full && self.show_video {
+            if let Some(have) = self.video.as_ref().map(|v| v.height()).filter(|h| *h > 0) {
+                if self.video_hd.is_some() {
+                    self.use_video_hd(&ctx, true);
+                } else if !self.video_hd_asked {
+                    if let Some(id) = self.want.clone() {
+                        self.video_hd_asked = true;
+                        // What the screen can show, limited by the quality chosen in Configuración.
+                        let screen_h = ((ctx.content_rect().height() - 92.0) * ctx.pixels_per_point()) as u32;
+                        let cap = if self.fs_quality == 0 { 1080 } else { self.fs_quality };
+                        let _ = self.cmd.send(Cmd::VideoHd(id, screen_h.min(cap).max(240), have));
+                    }
+                }
+            }
+        }
+        if let Some(v) = self.video.as_ref().filter(|_| video_visible) {
+            v.set_position(pos, pos_at, self.playing && !self.paused);
+            if let Some(f) = v.take_frame() {
+                // The picture is opaque, so premultiplied = straight and skips a per-pixel pass.
+                let img = egui::ColorImage::from_rgba_premultiplied([f.w, f.h], &f.rgba);
+                match &mut self.video_tex {
+                    Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                    None => self.video_tex = Some(ctx.load_texture("video", img, egui::TextureOptions::LINEAR)),
+                }
+            }
+        }
+        let mut toggle_video = false;
+        let mut toggle_shuffle = false;
 
         // ---- player bar ----
         egui::Panel::bottom("player")
@@ -2285,8 +3222,13 @@ impl eframe::App for App {
                         strip.cell(|ui| {
                             let avail = ui.available_width();
                             ui.horizontal(|ui| {
-                                ui.add_space(((avail - 182.0) / 2.0).max(0.0));
+                                // Fixed row height so every button is centred on the same line, whatever its size.
+                                ui.set_height(40.0);
+                                ui.add_space(((avail - 260.0) / 2.0).max(0.0));
                                 ui.spacing_mut().item_spacing.x = 16.0;
+                                if shuffle_button(ui, self.shuffle).on_hover_text(if self.shuffle { "Aleatorio: activado" } else { "Aleatorio" }).clicked() {
+                                    toggle_shuffle = true;
+                                }
                                 if icon_button(ui, Icon::Prev, 32.0, false).clicked() {
                                     self.step(-1);
                                 }
@@ -2297,6 +3239,18 @@ impl eframe::App for App {
                                 }
                                 if icon_button(ui, Icon::Next, 32.0, false).clicked() {
                                     self.step(1);
+                                }
+                                let tip = match self.repeat {
+                                    Repeat::Off => "Repetir: no",
+                                    Repeat::All => "Repetir: toda la cola",
+                                    Repeat::One => "Repetir: esta canción",
+                                };
+                                if repeat_button(ui, self.repeat).on_hover_text(tip).clicked() {
+                                    self.repeat = match self.repeat {
+                                        Repeat::Off => Repeat::All,
+                                        Repeat::All => Repeat::One,
+                                        Repeat::One => Repeat::Off,
+                                    };
                                 }
                                 if let Some(t) = &cur {
                                     let liked = self.liked.contains(&t.id);
@@ -2332,8 +3286,11 @@ impl eframe::App for App {
                                 if queue_button(ui, self.show_queue).on_hover_text("Cola").clicked() {
                                     self.show_queue = !self.show_queue;
                                 }
+                                if fs_button(ui, app_fs).on_hover_text(if app_fs { "Salir de pantalla completa (F11)" } else { "Pantalla completa (F11)" }).clicked() {
+                                    toggle_app_fs = true;
+                                }
                                 ui.label(egui::RichText::new("Vol").color(DIM).size(12.0));
-                                let (r, f) = thin_bar(ui, 90.0, self.volume);
+                                let (r, f) = thin_bar(ui, 64.0, self.volume);
                                 if r.dragged() || r.clicked() {
                                     self.volume = f;
                                     let _ = self.audio.send(Audio::Volume(f));
@@ -2439,29 +3396,99 @@ impl eframe::App for App {
             let _ = self.cmd.send(Cmd::Tracks(self.playlists[i].0.clone()));
         }
 
-        // ---- queue ----
-        if self.show_queue {
+        // ---- queue / lyrics ----
+        // Lyrics are fetched only while their tab is open and the song changes (a few KB of text, nothing else).
+        let want_lyrics = (self.show_queue && self.right_tab == RightTab::Lyrics) || (self.video_full && self.vfull_lyrics);
+        if want_lyrics {
+            if let Some(t) = &self.now {
+                if self.lyrics.as_ref().is_none_or(|(id, _)| *id != t.id) {
+                    self.lyrics = Some((t.id.clone(), Lyrics::Loading));
+                    let _ = self.cmd.send(Cmd::Lyrics(t.id.clone(), t.title.clone(), t.artist.clone(), t.secs));
+                }
+            }
+        }
+        // Where the song is now, in ms (the audio position is a sample taken a moment ago).
+        let now_ms = {
+            let lag = if self.playing && !self.paused { pos_at.map_or(0, |t| t.elapsed().as_millis() as u64) } else { 0 };
+            (pos.as_millis() as u64 + lag) as u32
+        };
+        let mut seek_to: Option<u32> = None;
+        let mut new_line = self.lyr_line;
+        if self.show_queue && !self.video_full {
+            let mut tab = self.right_tab;
             egui::Panel::right("queue")
                 .exact_size(330.0)
                 .resizable(false)
                 .frame(egui::Frame::new().fill(SIDEBAR).inner_margin(12.0))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Cola").strong().size(20.0));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if chip(ui, "Limpiar", false).clicked() {
-                                acts.push(Act::QClear);
-                            }
-                        });
+                        if chip(ui, "Cola", tab == RightTab::Queue).clicked() {
+                            tab = RightTab::Queue;
+                        }
+                        if chip(ui, "Letra", tab == RightTab::Lyrics).clicked() {
+                            tab = RightTab::Lyrics;
+                        }
+                        if tab == RightTab::Queue {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if chip(ui, "Limpiar", false).clicked() {
+                                    acts.push(Act::QClear);
+                                }
+                            });
+                        }
                     });
                     ui.add_space(6.0);
+                    if tab == RightTab::Queue {
+                        ui.horizontal(|ui| {
+                            if switch(ui, self.autoplay).clicked() {
+                                toggle_autoplay = true;
+                            }
+                            ui.label(egui::RichText::new("Sugerencias al terminar la cola").color(Color32::from_gray(200)).size(13.0));
+                        });
+                    }
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        if switch(ui, self.autoplay).clicked() {
-                            toggle_autoplay = true;
+                        if switch(ui, self.show_video).clicked() {
+                            toggle_video = true;
                         }
-                        ui.label(egui::RichText::new("Sugerencias al terminar la cola").color(Color32::from_gray(200)).size(13.0));
+                        ui.label(egui::RichText::new("Mostrar video si existe").color(Color32::from_gray(200)).size(13.0));
                     });
+                    if let Some(tex) = self.video_tex.as_ref().filter(|_| self.video.is_some()) {
+                        ui.add_space(8.0);
+                        let sz = tex.size_vec2();
+                        let w = ui.available_width();
+                        let img = ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(w, w * sz.y / sz.x)).corner_radius(8.0));
+                        // Fullscreen button over the corner of the video.
+                        let br = egui::Rect::from_center_size(img.rect.right_bottom() - egui::vec2(20.0, 20.0), egui::vec2(28.0, 28.0));
+                        let r = ui.interact(br, ui.scope_id().with("vfull_btn"), egui::Sense::click());
+                        ui.painter().rect_filled(br, 6.0, Color32::from_black_alpha(if r.hovered() { 200 } else { 130 }));
+                        fs_glyph(ui.painter(), br.center(), Color32::WHITE, false);
+                        if r.on_hover_text("Pantalla completa").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            enter_vfull = true;
+                        }
+                    } else if self.show_video && self.now.is_some() {
+                        // No video for this song (or it has not arrived yet): show the cover in its place, so
+                        // fullscreen is still available.
+                        if let Some(n) = &self.now {
+                            ui.add_space(8.0);
+                            let w = ui.available_width();
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(w, w * 9.0 / 16.0), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 8.0, Color32::from_gray(18));
+                            let side = rect.height();
+                            cover(ui, &n.cover, egui::Rect::from_center_size(rect.center(), egui::vec2(side, side)), 8.0);
+                            let br = egui::Rect::from_center_size(rect.right_bottom() - egui::vec2(20.0, 20.0), egui::vec2(28.0, 28.0));
+                            let r = ui.interact(br, ui.scope_id().with("vfull_btn_cover"), egui::Sense::click());
+                            ui.painter().rect_filled(br, 6.0, Color32::from_black_alpha(if r.hovered() { 200 } else { 130 }));
+                            fs_glyph(ui.painter(), br.center(), Color32::WHITE, false);
+                            if r.on_hover_text("Pantalla completa").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                enter_vfull = true;
+                            }
+                        }
+                    }
                     ui.add_space(12.0);
+                    if tab == RightTab::Lyrics {
+                        self.lyrics_ui(ui, now_ms, false, &mut seek_to, &mut new_line);
+                        return;
+                    }
                     if let Some(n) = &self.now {
                         ui.label(egui::RichText::new("AHORA SUENA").color(DIM).size(11.0));
                         let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 48.0), egui::Sense::hover());
@@ -2543,6 +3570,11 @@ impl eframe::App for App {
                         }
                     });
                 });
+            self.right_tab = tab;
+            self.lyr_line = new_line;
+            if let Some(ms) = seek_to {
+                let _ = self.audio.send(Audio::Seek(Duration::from_millis(ms as u64)));
+            }
         }
 
         // Queue drag & drop: start, preview under the pointer and drop.
@@ -2714,7 +3746,13 @@ impl eframe::App for App {
                     ui.add_space(8.0);
                     let mut new_kind = None;
                     ui.horizontal(|ui| {
-                        for (k, label) in [(Kind::Songs, "Canciones"), (Kind::Artists, "Artistas"), (Kind::Albums, "Álbumes")] {
+                        for (k, label) in [
+                            (Kind::Songs, "Canciones"),
+                            (Kind::Videos, "Videos"),
+                            (Kind::Artists, "Artistas"),
+                            (Kind::Albums, "Álbumes"),
+                            (Kind::Playlists, "Listas"),
+                        ] {
                             if chip(ui, label, self.kind == k).clicked() && self.kind != k {
                                 new_kind = Some(k);
                             }
@@ -3031,8 +4069,7 @@ impl eframe::App for App {
                     } else {
                         (vec![t], 0)
                     };
-                    self.queue = queue;
-                    self.play_queue(pos);
+                    self.start_queue(queue, pos);
                 }
             }
         }
@@ -3117,6 +4154,10 @@ impl eframe::App for App {
                                 }
                             }
                         }
+                        if menu_item(ui, "Iniciar radio") {
+                            acts.push(Act::StartRadio(m.track.clone()));
+                            close_menu = true;
+                        }
                         let liked = self.liked.contains(&m.track.id);
                         if menu_item(ui, if liked { "Quitar de Me gusta" } else { "Me gusta" }) {
                             acts.push(Act::Like(m.track.id.clone(), !liked));
@@ -3171,8 +4212,14 @@ impl eframe::App for App {
         }
         if toggle_autoplay {
             self.autoplay = !self.autoplay;
-            save_config(self.quality, self.prefetch, self.autoplay);
+            self.save_settings();
             self.ensure_suggestions();
+        }
+        if toggle_video {
+            self.set_video(!self.show_video);
+        }
+        if toggle_shuffle {
+            self.set_shuffle(!self.shuffle);
         }
 
         // ---- sidebar playlist menu ----
@@ -3310,85 +4357,350 @@ impl eframe::App for App {
 
         // ---- settings ----
         let mut check_now = false;
+        let mut video_change: Option<bool> = None;
+        let mut fsq_changed = false;
+        let mut autoplay_changed = false;
         let mut open = self.show_settings;
         egui::Window::new("Configuración")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
+            .fixed_size([680.0, 480.0])
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(&ctx, |ui| {
                 let mut changed = false;
-                ui.label(egui::RichText::new("FORMATO DE AUDIO").color(DIM).size(11.0));
-                for (q, name, hint) in [
-                    (Quality::Opus, "Opus", "mejor calidad, ~130 kbps"),
-                    (Quality::Aac, "AAC", "más compatible, ~130 kbps"),
-                ] {
-                    if ui.radio(self.quality == q, format!("{name}  ({hint})")).clicked() && self.quality != q {
-                        self.quality = q;
-                        changed = true;
-                    }
-                }
-                ui.label(egui::RichText::new("Se aplica a las próximas canciones.").color(DIM).size(12.0));
-                ui.add_space(10.0);
-                ui.label(egui::RichText::new("REPRODUCCIÓN").color(DIM).size(11.0));
-                if ui.checkbox(&mut self.prefetch, "Precargar la siguiente canción").changed() {
-                    changed = true;
-                }
-                ui.add_space(10.0);
-                ui.label(egui::RichText::new("SESIÓN DE YOUTUBE MUSIC").color(DIM).size(11.0));
-                if let Some(acc) = &self.account {
-                    ui.horizontal(|ui| {
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
-                        cover(ui, &acc.photo, rect, 20.0);
-                        ui.vertical(|ui| {
-                            ui.label(egui::RichText::new(&acc.name).strong());
-                            if !acc.handle.is_empty() {
-                                ui.label(egui::RichText::new(&acc.handle).color(DIM).size(12.0));
+                ui.horizontal_top(|ui| {
+                    // ---- navigation ----
+                    ui.vertical(|ui| {
+                        ui.set_width(150.0);
+                        ui.set_min_height(430.0);
+                        ui.add_space(4.0);
+                        for (tab, label) in [
+                            (SettingsTab::Playback, "Reproducción"),
+                            (SettingsTab::Video, "Video"),
+                            (SettingsTab::Lyrics, "Letra"),
+                            (SettingsTab::Account, "Cuenta"),
+                            (SettingsTab::Storage, "Almacenamiento"),
+                            (SettingsTab::About, "Acerca de"),
+                        ] {
+                            if nav_item(ui, label, self.settings_tab == tab).clicked() {
+                                self.settings_tab = tab;
                             }
-                            ui.label(egui::RichText::new("● Sesión activa").color(Color32::from_rgb(110, 210, 140)).size(12.0));
+                            ui.add_space(2.0);
+                        }
+                    });
+                    ui.separator();
+                    // ---- page ----
+                    ui.vertical(|ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            ui.set_width(ui.available_width() - 8.0);
+                            match self.settings_tab {
+                                SettingsTab::Playback => {
+                                    page_title(ui, "Reproducción");
+                                    settings_card(ui, |ui| {
+                                        setting_row(ui, "Formato de audio", "Opus tiene mejor calidad; AAC es más compatible. Ambos ~130 kbps. Se aplica a las próximas canciones.", |ui| {
+                                            let cur = if self.quality == Quality::Opus { 0 } else { 1 };
+                                            if let Some(i) = segmented(ui, &["Opus", "AAC"], cur) {
+                                                self.quality = if i == 0 { Quality::Opus } else { Quality::Aac };
+                                                changed = true;
+                                            }
+                                        });
+                                        card_divider(ui);
+                                        setting_row(ui, "Precargar la siguiente canción", "La baja de antemano para que no haya pausa entre canciones.", |ui| {
+                                            if switch(ui, self.prefetch).clicked() {
+                                                self.prefetch = !self.prefetch;
+                                                changed = true;
+                                            }
+                                        });
+                                        card_divider(ui);
+                                        setting_row(ui, "Sugerencias al terminar la cola", "Cuando no queda nada, sigue con canciones parecidas.", |ui| {
+                                            if switch(ui, self.autoplay).clicked() {
+                                                self.autoplay = !self.autoplay;
+                                                changed = true;
+                                                autoplay_changed = true;
+                                            }
+                                        });
+                                    });
+                                }
+                                SettingsTab::Video => {
+                                    page_title(ui, "Video");
+                                    settings_card(ui, |ui| {
+                                        setting_row(ui, "Mostrar el video si existe", "Es el valor con el que arranca la app; también se cambia desde la Cola. Apagado no carga ni gasta nada.", |ui| {
+                                            if switch(ui, self.video_default).clicked() {
+                                                self.video_default = !self.video_default;
+                                                changed = true;
+                                                video_change = Some(self.video_default);
+                                            }
+                                        });
+                                        card_divider(ui);
+                                        setting_row(
+                                            ui,
+                                            "Calidad máxima en pantalla completa",
+                                            "Más calidad usa más memoria mientras estás en pantalla completa: 480p ≈ +10 MB, 720p ≈ +20 MB, 1080p ≈ +40 MB. \"Pantalla\" usa la de tu pantalla, hasta 1080p. Solo si el video la ofrece.",
+                                            |ui| {
+                                                let opts = [(480u32, "480p"), (720, "720p"), (1080, "1080p"), (0, "Pantalla")];
+                                                let cur = opts.iter().position(|(h, _)| *h == self.fs_quality).unwrap_or(1);
+                                                let labels: Vec<&str> = opts.iter().map(|(_, l)| *l).collect();
+                                                if let Some(i) = segmented(ui, &labels, cur) {
+                                                    self.fs_quality = opts[i].0;
+                                                    changed = true;
+                                                    fsq_changed = true;
+                                                }
+                                            },
+                                        );
+                                    });
+                                }
+                                SettingsTab::Lyrics => {
+                                    page_title(ui, "Letra en pantalla completa");
+                                    settings_card(ui, |ui| {
+                                        setting_row(ui, "Estilo", "\"Sobre el video\" muestra pocas líneas que se desvanecen (necesita letra sincronizada; si no la hay, usa el panel). También se cambia con clic derecho.", |ui| {
+                                            let cur = if self.lyr_style == LyricsStyle::Overlay { 0 } else { 1 };
+                                            if let Some(i) = segmented(ui, &["Sobre el video", "Panel lateral"], cur) {
+                                                self.lyr_style = if i == 0 { LyricsStyle::Overlay } else { LyricsStyle::Panel };
+                                                changed = true;
+                                            }
+                                        });
+                                        card_divider(ui);
+                                        ui.add_enabled_ui(self.lyr_style == LyricsStyle::Overlay, |ui| {
+                                            setting_row(ui, "Líneas visibles", "Cuántas líneas se ven a la vez sobre el video.", |ui| {
+                                                let opts = [1u8, 3, 5];
+                                                let cur = opts.iter().position(|n| *n == self.lyr_lines).unwrap_or(1);
+                                                if let Some(i) = segmented(ui, &["1", "3", "5"], cur) {
+                                                    self.lyr_lines = opts[i];
+                                                    changed = true;
+                                                }
+                                            });
+                                        });
+                                        card_divider(ui);
+                                        setting_row(ui, "Mostrar al entrar en pantalla completa", "Si está apagado, se activa con el botón \"Letra\" o el clic derecho.", |ui| {
+                                            if switch(ui, self.lyr_default_on).clicked() {
+                                                self.lyr_default_on = !self.lyr_default_on;
+                                                changed = true;
+                                            }
+                                        });
+                                    });
+                                    ui.label(egui::RichText::new("Las letras sincronizadas vienen de LRCLIB; si no hay, se usa el texto de YouTube Music.").color(DIM).size(12.0));
+                                }
+                                SettingsTab::Account => {
+                                    page_title(ui, "Cuenta de YouTube Music");
+                                    settings_card(ui, |ui| {
+                                        if let Some(acc) = &self.account {
+                                            ui.horizontal(|ui| {
+                                                let (rect, _) = ui.allocate_exact_size(egui::vec2(48.0, 48.0), egui::Sense::hover());
+                                                cover(ui, &acc.photo, rect, 24.0);
+                                                ui.vertical(|ui| {
+                                                    ui.label(egui::RichText::new(&acc.name).strong().size(16.0));
+                                                    if !acc.handle.is_empty() {
+                                                        ui.label(egui::RichText::new(&acc.handle).color(DIM).size(12.5));
+                                                    }
+                                                    ui.label(egui::RichText::new("● Sesión activa").color(Color32::from_rgb(110, 210, 140)).size(12.5));
+                                                });
+                                            });
+                                        } else {
+                                            ui.label(egui::RichText::new("No hay una sesión iniciada. Entrá con tu cuenta de Google para ver tu biblioteca, tus playlists y Me gusta.").color(DIM).size(13.0));
+                                        }
+                                        ui.add_space(10.0);
+                                        let label = match (self.logging_in, self.account.is_some()) {
+                                            (true, _) => "Esperando inicio de sesión...",
+                                            (false, true) => "Cambiar de cuenta",
+                                            (false, false) => "Iniciar sesión",
+                                        };
+                                        if ui.add_enabled(!self.logging_in, egui::Button::new(label)).clicked() {
+                                            start_login = true;
+                                        }
+                                    });
+                                    ui.label(egui::RichText::new("La sesión se guarda solo en esta computadora y se renueva sola.").color(DIM).size(12.0));
+                                }
+                                SettingsTab::Storage => {
+                                    page_title(ui, "Almacenamiento");
+                                    settings_card(ui, |ui| {
+                                        setting_row(ui, "Caché de audio y video", &format!("{:.1} MB en la carpeta temporal. Se borra sola a los 7 días.", self.cache_bytes as f64 / 1_048_576.0), |ui| {
+                                            if ui.button("Limpiar").clicked() {
+                                                clear_cache();
+                                                self.cache_bytes = cache_size();
+                                            }
+                                        });
+                                        card_divider(ui);
+                                        setting_row(ui, "Imágenes en memoria", "Carátulas ya decodificadas; se descartan las que no se ven.", |ui| {
+                                            ui.label(egui::RichText::new(IMGS.lock().unwrap().order.len().to_string()).size(15.0));
+                                        });
+                                    });
+                                }
+                                SettingsTab::About => {
+                                    page_title(ui, "Acerca de Temazoo");
+                                    settings_card(ui, |ui| {
+                                        setting_row(ui, &format!("Versión {}", update::VERSION), "Reproductor de YouTube Music liviano para Windows, hecho en Rust.", |ui| {
+                                            let label = if self.checking_update { "Buscando..." } else { "Buscar actualizaciones" };
+                                            if ui.add_enabled(!self.checking_update && !self.updating, egui::Button::new(label)).clicked() {
+                                                check_now = true;
+                                            }
+                                        });
+                                    });
+                                    ui.label(egui::RichText::new("github.com/Fiambre/temazoo").color(DIM).size(12.5));
+                                }
+                            }
                         });
                     });
-                    ui.add_space(4.0);
-                }
-                let label = match (self.logging_in, self.account.is_some()) {
-                    (true, _) => "Esperando inicio de sesión...",
-                    (false, true) => "Cambiar de cuenta",
-                    (false, false) => "Iniciar sesión",
-                };
-                if ui.button(label).clicked() {
-                    start_login = true;
-                }
-                ui.add_space(10.0);
-                ui.label(egui::RichText::new("ACTUALIZACIONES").color(DIM).size(11.0));
-                ui.horizontal(|ui| {
-                    ui.label(format!("Versión {}", update::VERSION));
-                    let label = if self.checking_update { "Buscando..." } else { "Buscar actualizaciones" };
-                    if ui.add_enabled(!self.checking_update && !self.updating, egui::Button::new(label)).clicked() {
-                        check_now = true;
-                    }
-                });
-                ui.add_space(10.0);
-                ui.label(egui::RichText::new("CACHÉ").color(DIM).size(11.0));
-                ui.label(
-                    egui::RichText::new(format!("Imágenes en memoria: {}", IMGS.lock().unwrap().order.len()))
-                        .color(DIM)
-                        .size(12.5),
-                );
-                ui.horizontal(|ui| {
-                    ui.label(format!("{:.1} MB", self.cache_bytes as f64 / 1_048_576.0));
-                    if ui.button("Limpiar caché").clicked() {
-                        clear_cache();
-                        self.cache_bytes = cache_size();
-                    }
                 });
                 if changed {
-                    save_config(self.quality, self.prefetch, self.autoplay);
+                    self.save_settings();
                 }
             });
         self.show_settings = open;
+        if autoplay_changed {
+            self.ensure_suggestions();
+        }
+        // A new maximum quality: forget the high-resolution file so the next request uses the new limit.
+        if fsq_changed {
+            self.video_hd = None;
+            self.video_hd_asked = false;
+            self.use_video_hd(&ctx, false);
+        }
+        if let Some(on) = video_change {
+            self.set_video(on);
+        }
         if check_now {
             self.status = "Buscando actualizaciones...".into();
             self.check_update(&ctx, true);
+        }
+        // ---- fullscreen video: covers the app above the player bar, which stays for the controls ----
+        if self.video_full {
+            let sr = ctx.content_rect();
+            let rect = egui::Rect::from_min_max(sr.min, egui::pos2(sr.right(), sr.bottom() - 92.0));
+            let info = if self.vfull_debug { self.debug_lines(rect.size() * ctx.pixels_per_point()) } else { Vec::new() };
+            let mut toggle_debug = false;
+            let mut toggle_lyrics = false;
+            let (mut fs_seek, mut fs_line): (Option<u32>, usize) = (None, self.lyr_line);
+            let lyrics_on = self.vfull_lyrics;
+            // Overlay needs synced lyrics; plain ones (or the panel style) use the side panel. While they are
+            // still loading in overlay style, nothing is drawn so the layout does not jump.
+            let synced = matches!(self.lyrics, Some((_, Lyrics::Synced { .. })));
+            let loading = !matches!(self.lyrics, Some((_, Lyrics::Plain { .. } | Lyrics::Synced { .. } | Lyrics::Missing)));
+            let overlay = lyrics_on && self.lyr_style == LyricsStyle::Overlay && synced;
+            let side_panel = lyrics_on && !overlay && !(self.lyr_style == LyricsStyle::Overlay && loading);
+            let mut toggle_style = false;
+            egui::Area::new(ui.scope_id().with("video_full")).order(egui::Order::Foreground).fixed_pos(rect.min).show(&ctx, |ui| {
+                let (r, resp) = ui.allocate_exact_size(rect.size(), egui::Sense::click());
+                ui.painter().rect_filled(r, 0.0, Color32::BLACK);
+                // With the side panel, the picture takes the left part and the lyrics the right one.
+                let split = r.left() + r.width() * 0.58;
+                let media = if side_panel { egui::Rect::from_min_max(r.min, egui::pos2(split, r.bottom())) } else { r };
+                let mut picture = media;
+                if let Some(tex) = self.video_tex.as_ref().filter(|_| self.video.is_some()) {
+                    let sz = tex.size_vec2();
+                    let k = (media.width() / sz.x).min(media.height() / sz.y);
+                    let img = egui::Rect::from_center_size(media.center(), sz * k);
+                    picture = img;
+                    ui.painter().image(tex.id(), img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                } else if let Some(n) = &self.now {
+                    // No video for this song: the cover, large.
+                    let side = media.width().min(media.height()) * 0.8;
+                    cover(ui, &resize(&n.cover, 720), egui::Rect::from_center_size(media.center(), egui::vec2(side, side)), 12.0);
+                }
+                if overlay {
+                    // Over the picture itself (the video area; the whole screen when it is just the cover).
+                    let over = if self.video.is_some() { picture } else { media };
+                    self.lyrics_overlay(&ctx, ui.painter(), over, now_ms);
+                }
+                if side_panel {
+                    let lp = egui::Rect::from_min_max(egui::pos2(split, r.top()), r.max);
+                    ui.painter().rect_filled(lp, 0.0, Color32::from_black_alpha(150));
+                    let inner = lp.shrink2(egui::vec2(28.0, 70.0));
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+                        self.lyrics_ui(ui, now_ms, true, &mut fs_seek, &mut fs_line);
+                    });
+                }
+                // Buttons, top right: debug info ("i") and exit.
+                let br = egui::Rect::from_center_size(r.right_top() + egui::vec2(-30.0, 30.0), egui::vec2(32.0, 32.0));
+                let b = ui.interact(br, ui.scope_id().with("vfull_exit"), egui::Sense::click());
+                ui.painter().rect_filled(br, 6.0, Color32::from_black_alpha(if b.hovered() { 200 } else { 120 }));
+                fs_glyph(ui.painter(), br.center(), Color32::WHITE, true);
+                if b.on_hover_text("Salir (Esc)").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() || resp.double_clicked() {
+                    exit_vfull = true;
+                }
+                let ib = br.translate(egui::vec2(-40.0, 0.0));
+                let i = ui.interact(ib, ui.scope_id().with("vfull_info"), egui::Sense::click());
+                let lit = self.vfull_debug;
+                ui.painter().rect_filled(ib, 6.0, if lit { ACCENT } else { Color32::from_black_alpha(if i.hovered() { 200 } else { 120 }) });
+                ui.painter().text(ib.center(), egui::Align2::CENTER_CENTER, "i", egui::FontId::proportional(18.0), Color32::WHITE);
+                if i.on_hover_text("Información de depuración").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    toggle_debug = true;
+                }
+                let lb = egui::Rect::from_center_size(egui::pos2(ib.center().x - 56.0, ib.center().y), egui::vec2(64.0, 32.0));
+                let l = ui.interact(lb, ui.scope_id().with("vfull_lyrics"), egui::Sense::click());
+                ui.painter().rect_filled(lb, 6.0, if lyrics_on { ACCENT } else { Color32::from_black_alpha(if l.hovered() { 200 } else { 120 }) });
+                ui.painter().text(lb.center(), egui::Align2::CENTER_CENTER, "Letra", egui::FontId::proportional(15.0), Color32::WHITE);
+                if l.on_hover_text("Mostrar la letra").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    toggle_lyrics = true;
+                }
+                // Debug panel, top left.
+                if !info.is_empty() {
+                    let font = egui::FontId::monospace(13.0);
+                    let galleys: Vec<_> = info.iter().map(|l| ui.painter().layout_no_wrap(l.clone(), font.clone(), Color32::from_gray(235))).collect();
+                    let (w, h) = (galleys.iter().map(|g| g.size().x).fold(0.0, f32::max), galleys.iter().map(|g| g.size().y).sum::<f32>());
+                    let bg = egui::Rect::from_min_size(r.left_top() + egui::vec2(16.0, 16.0), egui::vec2(w + 20.0, h + 20.0));
+                    ui.painter().rect_filled(bg, 8.0, Color32::from_black_alpha(170));
+                    let mut y = bg.top() + 10.0;
+                    for g in galleys {
+                        let hh = g.size().y;
+                        ui.painter().galley(egui::pos2(bg.left() + 10.0, y), g, Color32::WHITE);
+                        y += hh;
+                    }
+                }
+                // Right click: context menu.
+                resp.context_menu(|ui| {
+                    if ui.button(if lyrics_on { "Ocultar la letra" } else { "Mostrar la letra" }).clicked() {
+                        toggle_lyrics = true;
+                        ui.close();
+                    }
+                    if ui.button(if self.lyr_style == LyricsStyle::Overlay { "Letra: pasar a panel lateral" } else { "Letra: pasar a sobre el video" }).clicked() {
+                        toggle_style = true;
+                        ui.close();
+                    }
+                    if ui.button(if self.vfull_debug { "Ocultar información de depuración" } else { "Información de depuración" }).clicked() {
+                        toggle_debug = true;
+                        ui.close();
+                    }
+                    if ui.button("Salir de pantalla completa").clicked() {
+                        exit_vfull = true;
+                        ui.close();
+                    }
+                });
+            });
+            if toggle_debug {
+                self.vfull_debug = !self.vfull_debug;
+            }
+            if toggle_lyrics {
+                self.vfull_lyrics = !self.vfull_lyrics;
+            }
+            if toggle_style {
+                self.lyr_style = if self.lyr_style == LyricsStyle::Overlay { LyricsStyle::Panel } else { LyricsStyle::Overlay };
+                self.vfull_lyrics = true;
+                self.save_settings();
+            }
+            self.lyr_line = fs_line;
+            if let Some(ms) = fs_seek {
+                let _ = self.audio.send(Audio::Seek(Duration::from_millis(ms as u64)));
+            }
+        }
+        if enter_vfull && !self.video_full {
+            self.vfull_app_was_fs = app_fs;
+            self.vfull_seen_fs = app_fs;
+            self.video_full = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+            // (The higher resolution is requested by the per-frame check above, as soon as there is a video.)
+        }
+        if exit_vfull && self.video_full {
+            self.video_full = false;
+            // Back to the small player: the lighter file is enough there.
+            self.use_video_hd(&ctx, false);
+            if !self.vfull_app_was_fs {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            }
+        }
+        if toggle_app_fs {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!app_fs));
         }
         evict_images(&ctx);
         if hand && self.dialog.is_none() && self.drag_from.is_none() {
@@ -3422,3 +4734,57 @@ fn main() -> eframe::Result<()> {
 }
 
 
+
+/// Working set of this process in MB (what the task manager shows).
+fn process_mem_mb() -> Option<u64> {
+    use windows::Win32::System::{
+        ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+        Threading::GetCurrentProcess,
+    };
+    unsafe {
+        let mut c = PROCESS_MEMORY_COUNTERS { cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+        K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb).as_bool().then(|| c.WorkingSetSize as u64 / 1_048_576)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lrc_lines_and_word_tags() {
+        let l = parse_lrc("[ar:Someone]\n[00:18.89] <00:18.89>We're <00:19.25>no <00:19.53>strangers\n[01:02.5]Second\n[00:05.00][00:40.00] Chorus\n[00:50.00]");
+        assert_eq!(l[0], (5000, "Chorus".to_string()));
+        assert_eq!(l[1], (18890, "We're no strangers".to_string()));
+        assert_eq!(l[2], (40000, "Chorus".to_string()));
+        assert_eq!(l[3], (50000, String::new()));
+        assert_eq!(l[4], (62500, "Second".to_string()));
+        assert_eq!(l.len(), 5);
+    }
+
+    #[test]
+    fn titles_lose_video_decoration() {
+        assert_eq!(clean_title("Roots Bloody Roots (Official Video) [HD]"), "Roots Bloody Roots");
+        assert_eq!(clean_title("Never Gonna Give You Up (Remastered 2022)"), "Never Gonna Give You Up");
+        assert_eq!(clean_title("Song (feat. Someone)"), "Song (feat. Someone)");
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    /// Talks to lrclib.net: run with `cargo test --release live -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_lrclib() {
+        let a = lrclib_synced("Never Gonna Give You Up (Official Video)", "Rick Astley", 213).await;
+        println!("rick: {:?}", a.as_ref().map(|l| (l.len(), l[0].clone())));
+        assert!(a.is_some_and(|l| l.len() > 20));
+        let b = lrclib_synced("Roots Bloody Roots", "Sepultura Official", 212).await;
+        println!("sepultura (channel as artist): {:?}", b.as_ref().map(|l| l.len()));
+        assert!(b.is_some());
+        let c = lrclib_synced("zzzz qqqq nonexistent song xyz", "nobody", 100).await;
+        assert!(c.is_none());
+    }
+}

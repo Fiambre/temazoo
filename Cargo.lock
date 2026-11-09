@@ -4410,6 +4410,7 @@ dependencies = [
  "symphonia-adapter-opus-rs",
  "tao",
  "tokio",
+ "windows",
  "winresource",
  "wry",
  "ytmusicapi",
