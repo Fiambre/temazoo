@@ -1392,13 +1392,67 @@ fn spawn_backend(ctx: egui::Context, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<E
     });
 }
 
+/// How long after the player hands a sample to the output it is actually heard (µs), measured by the
+/// output stream on every callback: buffered audio plus the delay the device reports.
+static OUT_LATENCY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The position being heard right now, given the position the player reports (which runs ahead of the
+/// speakers by the output delay). The picture is timed against this, not against the raw position.
+fn heard(pos: Duration) -> Duration {
+    pos.saturating_sub(Duration::from_micros(OUT_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed)))
+}
+
+/// Opens the default output and plays a rodio mixer through it. Unlike rodio's own sink, the callback
+/// keeps the output delay that the system reports, so video can follow the sound and not the buffer.
+fn open_output() -> Option<(rodio::cpal::Stream, rodio::mixer::Mixer)> {
+    use rodio::cpal::{self, traits::{DeviceTrait, HostTrait, StreamTrait}};
+    use std::sync::atomic::Ordering;
+    let device = cpal::default_host().default_output_device()?;
+    let cfg = device.default_output_config().ok()?;
+    let (channels, rate) = (cfg.channels(), cfg.sample_rate());
+    let (mixer, mut source) = rodio::mixer::mixer(std::num::NonZero::new(channels)?, std::num::NonZero::new(rate)?);
+    // About 50 ms of buffer, as rodio does: decoding runs inside the callback and needs the slack.
+    let want = (rate / 20).max(2);
+    let (next, prev) = (want.next_power_of_two(), want.next_power_of_two() >> 1);
+    let frames = if want - prev <= next - want { prev } else { next };
+    let config = cpal::StreamConfig { channels, sample_rate: rate, buffer_size: cpal::BufferSize::Fixed(frames) };
+    let stream = device
+        .build_output_stream(
+            config,
+            move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                // `playback` is when the first sample written now will sound. The position is read after
+                // whole blocks, at a random moment between two callbacks, so on average it is half a block
+                // further ahead still.
+                let ts = info.timestamp();
+                let block_us = data.len() as u64 * 1_000_000 / (channels.max(1) as u64 * rate.max(1) as u64);
+                let us = ts.playback.duration_since(ts.callback).as_micros() as u64 + block_us / 2;
+                let old = OUT_LATENCY_US.load(Ordering::Relaxed);
+                OUT_LATENCY_US.store(if old == 0 { us } else { (old * 15 + us) / 16 }, Ordering::Relaxed);
+                for d in data.iter_mut() {
+                    *d = source.next().unwrap_or(0.0);
+                }
+            },
+            |e| eprintln!("audio: {e}"),
+            None,
+        )
+        .ok()?;
+    stream.play().ok()?;
+    Some((stream, mixer))
+}
+
 fn spawn_audio(rx: mpsc::Receiver<Audio>, state: Arc<Mutex<AudioState>>) {
     std::thread::spawn(move || {
-        let Ok(sink) = DeviceSinkBuilder::open_default_sink() else {
-            eprintln!("no hay dispositivo de audio");
-            return;
+        // Our own output stream when possible (it tells us how late the sound comes out); rodio's otherwise.
+        let own = open_output();
+        let fallback = if own.is_none() { DeviceSinkBuilder::open_default_sink().ok() } else { None };
+        let player = match (&own, &fallback) {
+            (Some((_, mixer)), _) => Player::connect_new(mixer),
+            (None, Some(sink)) => Player::connect_new(sink.mixer()),
+            (None, None) => {
+                eprintln!("no hay dispositivo de audio");
+                return;
+            }
         };
-        let player = Player::connect_new(sink.mixer());
         let mut loaded = false;
         let mut vol = 0.7f32;
         loop {
@@ -2510,7 +2564,13 @@ impl App {
             format!("Cuadros    {:.1}/s  mostrados {}  descartados {}", self.dbg_fps, st.shown, st.dropped),
             format!("Decodifica {:.1} ms/cuadro  color {:.1} ms", st.decode_ms, st.convert_ms),
             format!("Sincronía  {:+} ms respecto al audio", st.sync_ms),
-            format!("Audio      {}  posición {}:{:02}", if self.quality == Quality::Opus { "Opus" } else { "AAC" }, pos / 60, pos % 60),
+            format!(
+                "Audio      {}  posición {}:{:02}  salida +{} ms",
+                if self.quality == Quality::Opus { "Opus" } else { "AAC" },
+                pos / 60,
+                pos % 60,
+                OUT_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed) / 1000
+            ),
             format!("Memoria    {} MB (toda la app)", self.dbg_mem),
         ]
     }
@@ -2672,7 +2732,7 @@ impl App {
         // The audio position is a sample taken a moment ago: add the time since.
         let pos = if running { pos + at.map_or(Duration::ZERO, |t| t.elapsed()) } else { pos };
         let c = ctx.clone();
-        self.video = Some(video::Video::start(path, pos, running, move || c.request_repaint()));
+        self.video = Some(video::Video::start(path, heard(pos), running, move || c.request_repaint()));
     }
 
     /// Switches between the normal and the high-resolution file (the latter is used in fullscreen).
@@ -3174,7 +3234,7 @@ impl eframe::App for App {
             }
         }
         if let Some(v) = self.video.as_ref().filter(|_| video_visible) {
-            v.set_position(pos, pos_at, self.playing && !self.paused);
+            v.set_position(heard(pos), pos_at, self.playing && !self.paused);
             if let Some(f) = v.take_frame() {
                 // The picture is opaque, so premultiplied = straight and skips a per-pixel pass.
                 let img = egui::ColorImage::from_rgba_premultiplied([f.w, f.h], &f.rgba);

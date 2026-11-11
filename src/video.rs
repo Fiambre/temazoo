@@ -38,6 +38,10 @@ struct Shared {
     running: AtomicBool,
     /// Free-running clock: (position in ms, when it was valid). Audio reports only nudge it.
     anchor: Mutex<(f64, Instant)>,
+    /// When the audio position last changed, and whether it has been frozen long enough to call it a stall
+    /// (buffering): the clock must not keep running ahead of audio that is not advancing.
+    changed_at: Mutex<Instant>,
+    stalled: AtomicBool,
     /// Height in pixels of the video being decoded (0 until it is open).
     height: AtomicU64,
     // Counters for the debug panel.
@@ -61,6 +65,8 @@ impl Video {
             pos_ms: AtomicU64::new(pos.as_millis() as u64),
             running: AtomicBool::new(running),
             anchor: Mutex::new((pos.as_millis() as f64, Instant::now())),
+            changed_at: Mutex::new(Instant::now()),
+            stalled: AtomicBool::new(false),
             height: AtomicU64::new(0),
             shown: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
@@ -104,16 +110,25 @@ impl Video {
         let lag = if running { at.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0) } else { 0.0 };
 
         let was_running = self.shared.running.swap(running, Ordering::Relaxed);
+        let moved = self.shared.pos_ms.swap(sampled_ms, Ordering::Relaxed) != sampled_ms;
+        if moved {
+            *self.shared.changed_at.lock().unwrap() = Instant::now();
+        }
+        // The audio thread samples every ~50 ms, so a position that stays put while its sample is fresh
+        // means the audio is not advancing (buffering): hold the clock there instead of running ahead.
+        let fresh = at.is_some_and(|t| t.elapsed() < Duration::from_millis(400));
+        let stalled = running && !moved && fresh && self.shared.changed_at.lock().unwrap().elapsed() > Duration::from_millis(700);
+        let was_stalled = self.shared.stalled.swap(stalled, Ordering::Relaxed);
         // The audio position only updates every ~200 ms and reaches us a little late each time, so
-        // the video keeps its own smooth clock and the audio only corrects it gently (10 % of the
+        // the video keeps its own smooth clock and the audio only corrects it gently (25 % of the
         // error per report). A big error means a seek or a pause/resume: follow it at once.
-        if self.shared.pos_ms.swap(sampled_ms, Ordering::Relaxed) != sampled_ms || running != was_running {
+        if moved || running != was_running || stalled != was_stalled {
             let now = Instant::now();
             let mut a = self.shared.anchor.lock().unwrap();
-            let est = a.0 + if was_running { a.1.elapsed().as_secs_f64() * 1000.0 } else { 0.0 };
+            let est = a.0 + if was_running && !was_stalled { a.1.elapsed().as_secs_f64() * 1000.0 } else { 0.0 };
             let target = sampled_ms as f64 + lag;
             let err = target - est;
-            *a = if !running || !was_running || err.abs() > 300.0 { (target, now) } else { (est + err * 0.1, now) };
+            *a = if !running || !was_running || stalled || was_stalled || err.abs() > 200.0 { (target, now) } else { (est + err * 0.25, now) };
         }
     }
 
@@ -166,6 +181,23 @@ fn annexb_header(avcc: &[u8]) -> Option<(Vec<u8>, usize)> {
     i += 1;
     take(n_pps, &mut i, &mut out)?;
     Some((out, nal_len))
+}
+
+/// How far before the current position a mid-file start seeks, so a keyframe comes before it.
+const SEEK_BACK_MS: u64 = 6000;
+
+/// Whether the packet (length-prefixed NAL units) holds a keyframe the decoder can start from (IDR slice).
+fn has_idr(pkt: &[u8], nal_len: usize) -> bool {
+    let mut i = 0;
+    while i + nal_len < pkt.len() {
+        let l = pkt[i..i + nal_len].iter().fold(0usize, |a, b| a << 8 | *b as usize);
+        i += nal_len;
+        if pkt[i] & 0x1f == 5 {
+            return true;
+        }
+        i += l;
+    }
+    false
 }
 
 fn to_annexb(pkt: &[u8], nal_len: usize, out: &mut Vec<u8>) {
@@ -235,18 +267,22 @@ enum End {
     Stop,
     /// The position moved back: decode again from the start.
     Rewind,
+    /// The decoder fell far behind the audio: start again near it (once, to avoid looping).
+    Behind,
 }
 
 fn run(path: &PathBuf, sh: &Shared, repaint: &dyn Fn()) -> Result<(), String> {
+    let mut guard = false;
     loop {
-        match unsafe { play(path, sh, repaint) }? {
+        match unsafe { play(path, sh, repaint, guard) }? {
             End::Stop => return Ok(()),
-            End::Rewind => {}
+            End::Rewind => guard = false,
+            End::Behind => guard = true,
         }
     }
 }
 
-unsafe fn play(path: &PathBuf, sh: &Shared, repaint: &dyn Fn()) -> Result<End, String> {
+unsafe fn play(path: &PathBuf, sh: &Shared, repaint: &dyn Fn(), guard: bool) -> Result<End, String> {
     let e = |e: windows::core::Error| e.to_string();
     let file = File::open(path).map_err(|e| e.to_string())?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -261,13 +297,18 @@ unsafe fn play(path: &PathBuf, sh: &Shared, repaint: &dyn Fn()) -> Result<End, S
     let (cw, ch) = (vp.width.ok_or("sin ancho")? as usize, vp.height.ok_or("sin alto")? as usize);
     sh.height.store(ch as u64, Ordering::Relaxed);
     let (hdr, nal_len) = annexb_header(&vp.extra_data.first().ok_or("sin avcC")?.data).ok_or("avcC inválido")?;
-    // Start near the current position (at a keyframe) instead of decoding everything before it.
-    let start = clock(sh).saturating_sub(1000);
+    // Start near the current position instead of decoding everything before it. The seek lands on any
+    // frame, not on a keyframe, and the decoder throws away whatever comes before the first keyframe: so
+    // go back far enough for one to come before the current position (YouTube places them ~5 s apart),
+    // and feed the decoder from that keyframe on (see `seeking` below).
+    let start = clock(sh).saturating_sub(SEEK_BACK_MS);
+    let mut seeking = false;
     if start > 3000 {
         if let Some(time) = Time::try_from_secs_f64(start as f64 / 1000.0) {
-            let _ = fmt.seek(SeekMode::Coarse, SeekTo::Time { time, track_id: Some(tid) });
+            seeking = fmt.seek(SeekMode::Coarse, SeekTo::Time { time, track_id: Some(tid) }).is_ok();
         }
     }
+    let mut skipped = 0u32;
 
     let mft: IMFTransform = CoCreateInstance(&CLSID_MSH264DecoderMFT, None, CLSCTX_INPROC_SERVER).map_err(e)?;
     // Low-latency mode: the decoder hands frames out as soon as it can instead of holding a pile of them
@@ -301,6 +342,11 @@ unsafe fn play(path: &PathBuf, sh: &Shared, repaint: &dyn Fn()) -> Result<End, S
             if pos + 1500 < *last_pts {
                 return Ok(Some(End::Rewind));
             }
+            if !guard && pts + SEEK_BACK_MS + 4000 < pos {
+                // Far behind (a jump forward, or a stall): decoding every frame in between would take a
+                // while, so start over from a keyframe near the audio. Only once per pass.
+                return Ok(Some(End::Behind));
+            }
             if pts + 120 < pos {
                 *last_pts = pts;
                 sh.dropped.fetch_add(1, Ordering::Relaxed);
@@ -333,6 +379,17 @@ unsafe fn play(path: &PathBuf, sh: &Shared, repaint: &dyn Fn()) -> Result<End, S
     while let Ok(Some(p)) = fmt.next_packet() {
         if p.track_id != tid {
             continue;
+        }
+        // After a seek, wait for a keyframe. Feeding the frames before it would be useless (the decoder
+        // drops them) and harmful: their times would be handed to the frames that do come out, which
+        // then show early, by as much as the distance to the keyframe. Give up after a while in case
+        // the file marks keyframes some other way.
+        if seeking {
+            if !has_idr(&p.data, nal_len) && skipped < 900 {
+                skipped += 1;
+                continue;
+            }
+            seeking = false;
         }
         data.clear();
         if first {
@@ -411,7 +468,7 @@ unsafe fn play(path: &PathBuf, sh: &Shared, repaint: &dyn Fn()) -> Result<End, S
 fn clock(sh: &Shared) -> u64 {
     let (pos, at) = *sh.anchor.lock().unwrap();
     // Cap how far it can run ahead of the last report, in case the UI stops reporting (window minimized).
-    let ahead = if sh.running.load(Ordering::Relaxed) { (at.elapsed().as_secs_f64() * 1000.0).min(1500.0) } else { 0.0 };
+    let ahead = if sh.running.load(Ordering::Relaxed) && !sh.stalled.load(Ordering::Relaxed) { (at.elapsed().as_secs_f64() * 1000.0).min(1500.0) } else { 0.0 };
     (pos + ahead).max(0.0) as u64
 }
 
