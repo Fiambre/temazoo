@@ -52,7 +52,15 @@ pub fn run(visible: bool) -> i32 {
     };
     let mut ctx = WebContext::new(Some(profile_dir()));
     let url = if visible { LOGIN_URL } else { MUSIC_URL };
-    let Ok(webview) = WebViewBuilder::new_with_web_context(&mut ctx).with_url(url).build(&window) else {
+    let mut builder = WebViewBuilder::new_with_web_context(&mut ctx).with_url(url);
+    // The proxy chosen in Configuración → Red (WebView2 takes a host and port, without credentials).
+    if let Some(u) = std::env::var("ALL_PROXY").ok().filter(|u| u.starts_with("socks")) {
+        let hostport = u.split("://").nth(1).unwrap_or("").rsplit('@').next().unwrap_or("").trim_end_matches('/');
+        if let Some((host, port)) = hostport.rsplit_once(':') {
+            builder = builder.with_proxy_config(wry::ProxyConfig::Socks5(wry::ProxyEndpoint { host: host.to_string(), port: port.to_string() }));
+        }
+    }
+    let Ok(webview) = builder.build(&window) else {
         return FAILED;
     };
 

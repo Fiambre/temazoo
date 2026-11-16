@@ -11,7 +11,7 @@ strip = true
 panic = "abort"
 
 [dependencies]
-eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "clipboard"] }
 egui_extras = { version = "0.37.0", features = ["image", "http"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 raw-window-handle = "0.6"
@@ -25,6 +25,9 @@ tao = "0.37.2"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "process", "macros", "time"] }
 wry = "0.57.1"
 ytmusicapi = "0.4"
+# Not used directly: these turn on SOCKS support in the HTTP clients that ytmusicapi and the image loader bring.
+reqwest = { version = "0.12", default-features = false, features = ["socks"] }
+ureq = { version = "3", default-features = false, features = ["socks-proxy"] }
 
 [build-dependencies]
 winresource = "0.1.34"

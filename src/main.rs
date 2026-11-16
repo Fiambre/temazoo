@@ -149,16 +149,86 @@ fn load_fs_quality() -> u32 {
         })
 }
 
+/// Writes `config.json`, keeping keys this function does not own (like `proxy`).
 fn save_config(q: Quality, prefetch: bool, autoplay: bool, video: bool, lyrics: (LyricsStyle, u8, bool), fs_quality: u32) {
-    let f = if q == Quality::Aac { "aac" } else { "opus" };
-    let style = if lyrics.0 == LyricsStyle::Panel { "panel" } else { "overlay" };
-    let _ = std::fs::write(
-        "config.json",
-        format!(
-            "{{\n  \"audio_format\": \"{f}\",\n  \"prefetch\": {prefetch},\n  \"autoplay\": {autoplay},\n  \"video\": {video},\n  \"lyrics_style\": \"{style}\",\n  \"lyrics_lines\": {},\n  \"lyrics_fullscreen\": {},\n  \"fullscreen_quality\": {}\n}}\n",
-            lyrics.1, lyrics.2, fs_quality
-        ),
-    );
+    let mut v = read_config();
+    v["audio_format"] = (if q == Quality::Aac { "aac" } else { "opus" }).into();
+    v["prefetch"] = prefetch.into();
+    v["autoplay"] = autoplay.into();
+    v["video"] = video.into();
+    v["lyrics_style"] = (if lyrics.0 == LyricsStyle::Panel { "panel" } else { "overlay" }).into();
+    v["lyrics_lines"] = lyrics.1.into();
+    v["lyrics_fullscreen"] = lyrics.2.into();
+    v["fullscreen_quality"] = fs_quality.into();
+    write_config(&v);
+}
+
+fn read_config() -> serde_json::Value {
+    std::fs::read_to_string("config.json")
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+fn write_config(v: &serde_json::Value) {
+    let _ = std::fs::write("config.json", serde_json::to_string_pretty(v).unwrap_or_default() + "\n");
+}
+
+/// The SOCKS5 proxy chosen in Configuración → Red ("" = connect directly).
+fn load_proxy() -> String {
+    read_config()["proxy"].as_str().map(|s| s.trim().to_string()).unwrap_or_default()
+}
+
+fn save_proxy(p: &str) {
+    let mut v = read_config();
+    v["proxy"] = p.trim().into();
+    write_config(&v);
+}
+
+/// `host:port` or a full URL -> a proxy URL. A bare address means SOCKS5 with the name resolved by the
+/// proxy (`socks5h`), so what the machine's own DNS says about a site does not matter.
+fn proxy_url(p: &str) -> Option<String> {
+    let p = p.trim();
+    if p.is_empty() {
+        return None;
+    }
+    Some(if p.contains("://") { p.to_string() } else { format!("socks5h://{p}") })
+}
+
+/// Makes the whole process (and the programs it starts: yt-dlp, curl) use the proxy. The HTTP clients
+/// read these variables when they are created, so a change needs a restart. With no proxy set, the
+/// system's own settings are left alone.
+fn apply_proxy() {
+    if let Some(u) = proxy_url(&load_proxy()) {
+        std::env::set_var("ALL_PROXY", &u);
+        std::env::set_var("all_proxy", &u);
+        // Anything local goes direct.
+        std::env::set_var("NO_PROXY", "localhost,127.0.0.1,::1");
+    }
+}
+
+/// Asks YouTube Music through the proxy and says whether it answered.
+fn test_proxy(url: &str) -> String {
+    let mut c = std::process::Command::new("curl.exe");
+    c.args(["-sS", "-o", "NUL", "-w", "%{http_code}", "--max-time", "10", "-x", url, "https://music.youtube.com/"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000);
+    }
+    match c.output() {
+        Ok(o) if o.status.success() => {
+            let code = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if code.starts_with('2') || code.starts_with('3') {
+                format!("Funciona: YouTube Music respondió ({code}).")
+            } else {
+                format!("El proxy respondió, pero YouTube Music devolvió {code}.")
+            }
+        }
+        Ok(o) => format!("No se pudo conectar: {}", String::from_utf8_lossy(&o.stderr).trim()),
+        Err(e) => format!("No se pudo ejecutar curl: {e}"),
+    }
 }
 
 fn cache_size() -> u64 {
@@ -1582,6 +1652,7 @@ enum SettingsTab {
     Video,
     Lyrics,
     Account,
+    Network,
     Storage,
     About,
 }
@@ -2180,6 +2251,12 @@ struct App {
     video_hd_asked: bool,
     show_settings: bool,
     cache_bytes: u64,
+    /// Proxy text being edited, what is saved, and what this run started with.
+    proxy_edit: String,
+    proxy_saved: String,
+    proxy_active: String,
+    proxy_msg: Option<String>,
+    proxy_test: Arc<Mutex<Option<String>>>,
     query: String,
     is_search: bool,
     search_q: String,
@@ -2327,6 +2404,11 @@ impl App {
             video_hd_asked: false,
             show_settings: false,
             cache_bytes: 0,
+            proxy_edit: load_proxy(),
+            proxy_saved: load_proxy(),
+            proxy_active: load_proxy(),
+            proxy_msg: None,
+            proxy_test: Arc::new(Mutex::new(None)),
             query: String::new(),
             is_search: false,
             search_q: String::new(),
@@ -4440,6 +4522,7 @@ impl eframe::App for App {
                             (SettingsTab::Video, "Video"),
                             (SettingsTab::Lyrics, "Letra"),
                             (SettingsTab::Account, "Cuenta"),
+                            (SettingsTab::Network, "Red"),
                             (SettingsTab::Storage, "Almacenamiento"),
                             (SettingsTab::About, "Acerca de"),
                         ] {
@@ -4571,6 +4654,51 @@ impl eframe::App for App {
                                         }
                                     });
                                     ui.label(egui::RichText::new("La sesión se guarda solo en esta computadora y se renueva sola.").color(DIM).size(12.0));
+                                }
+                                SettingsTab::Network => {
+                                    page_title(ui, "Red");
+                                    settings_card(ui, |ui| {
+                                        setting_row(
+                                            ui,
+                                            "Proxy SOCKS5",
+                                            "Servidor por el que sale todo el tráfico de Temazoo: música, carátulas, letras, inicio de sesión y actualizaciones. Escribí servidor:puerto, o la dirección completa con usuario y contraseña. Vacío = conexión directa. Se aplica al reiniciar.",
+                                            |_| {},
+                                        );
+                                        ui.add_space(6.0);
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut self.proxy_edit)
+                                                    .hint_text("127.0.0.1:1080  ·  socks5h://usuario:clave@host:1080")
+                                                    .desired_width(ui.available_width() - 170.0),
+                                            );
+                                            if ui.button("Guardar").clicked() {
+                                                self.proxy_edit = self.proxy_edit.trim().to_string();
+                                                save_proxy(&self.proxy_edit);
+                                                self.proxy_saved = self.proxy_edit.clone();
+                                                *self.proxy_test.lock().unwrap() = None;
+                                                self.proxy_msg = Some("Guardado.".into());
+                                            }
+                                            if ui.add_enabled(!self.proxy_edit.trim().is_empty(), egui::Button::new("Probar")).clicked() {
+                                                let slot = self.proxy_test.clone();
+                                                *slot.lock().unwrap() = Some("Probando...".into());
+                                                if let Some(u) = proxy_url(&self.proxy_edit) {
+                                                    let c = ctx.clone();
+                                                    std::thread::spawn(move || {
+                                                        let r = test_proxy(&u);
+                                                        *slot.lock().unwrap() = Some(r);
+                                                        c.request_repaint();
+                                                    });
+                                                }
+                                            }
+                                        });
+                                        let test = self.proxy_test.lock().unwrap().clone();
+                                        if let Some(m) = test.or_else(|| self.proxy_msg.clone()) {
+                                            ui.label(egui::RichText::new(m).color(DIM).size(12.5));
+                                        }
+                                        if self.proxy_saved != self.proxy_active {
+                                            ui.label(egui::RichText::new("Reiniciá Temazoo para que el cambio se aplique.").color(ACCENT).size(12.5));
+                                        }
+                                    });
                                 }
                                 SettingsTab::Storage => {
                                     page_title(ui, "Almacenamiento");
@@ -4771,6 +4899,7 @@ impl eframe::App for App {
 
 fn main() -> eframe::Result<()> {
     enter_data_dir();
+    apply_proxy();
     // Child-process modes used to capture the Google session (see login.rs).
     match std::env::args().nth(1).as_deref() {
         Some("--login") => std::process::exit(login::run(true)),
