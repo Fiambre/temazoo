@@ -1465,11 +1465,14 @@ fn spawn_backend(ctx: egui::Context, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<E
 /// How long after the player hands a sample to the output it is actually heard (µs), measured by the
 /// output stream on every callback: buffered audio plus the delay the device reports.
 static OUT_LATENCY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// No real output has more delay than this; anything above is a bad reading.
+const MAX_OUT_LATENCY_US: u64 = 500_000;
 
 /// The position being heard right now, given the position the player reports (which runs ahead of the
 /// speakers by the output delay). The picture is timed against this, not against the raw position.
 fn heard(pos: Duration) -> Duration {
-    pos.saturating_sub(Duration::from_micros(OUT_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed)))
+    let lat = OUT_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed).min(MAX_OUT_LATENCY_US);
+    pos.saturating_sub(Duration::from_micros(lat))
 }
 
 /// Opens the default output and plays a rodio mixer through it. Unlike rodio's own sink, the callback
@@ -1496,8 +1499,12 @@ fn open_output() -> Option<(rodio::cpal::Stream, rodio::mixer::Mixer)> {
                 let ts = info.timestamp();
                 let block_us = data.len() as u64 * 1_000_000 / (channels.max(1) as u64 * rate.max(1) as u64);
                 let us = ts.playback.duration_since(ts.callback).as_micros() as u64 + block_us / 2;
-                let old = OUT_LATENCY_US.load(Ordering::Relaxed);
-                OUT_LATENCY_US.store(if old == 0 { us } else { (old * 15 + us) / 16 }, Ordering::Relaxed);
+                // Some devices report nonsense timestamps now and then (seen: 73 000 s): a delay longer than
+                // MAX_OUT_LATENCY_US is not a delay, so it is ignored instead of poisoning the average.
+                if us <= MAX_OUT_LATENCY_US {
+                    let old = OUT_LATENCY_US.load(Ordering::Relaxed);
+                    OUT_LATENCY_US.store(if old == 0 { us } else { (old * 15 + us) / 16 }, Ordering::Relaxed);
+                }
                 for d in data.iter_mut() {
                     *d = source.next().unwrap_or(0.0);
                 }
